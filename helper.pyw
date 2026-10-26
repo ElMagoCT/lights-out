@@ -1,0 +1,226 @@
+"""Lights Out helper: the one elevated piece. Installed as the scheduled task
+"LightsOutHelper" (run with highest privileges at logon) by "Install Lights
+Out.bat"; the tray app starts it through that task when it is not running.
+
+It serves a tiny JSON API on 127.0.0.1 only, protected by a random token
+written to %LOCALAPPDATA%\\LightsOut\\helper.token (same user, so the tray
+app can read it). What needs elevation lives here and nowhere else:
+
+  * ASUS ROG firmware (ATKACPI): performance mode, PPT limits, fan curves,
+    CPU/GPU temperatures, fan RPM  -- only on ASUS laptops that expose it
+  * RyzenAdj (optional, if the user drops ryzenadj.exe into tools\\)
+  * the privileged half of the security assessment (BitLocker, Secure Boot,
+    SMB1, LSA protection)
+
+Nothing here loops or polls: it sleeps on the socket until asked.
+"""
+import ctypes
+import json
+import logging
+import logging.handlers
+import os
+import secrets
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, APP_DIR)
+DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", APP_DIR), "LightsOut")
+os.makedirs(DATA_DIR, exist_ok=True)
+TOKEN_PATH = os.path.join(DATA_DIR, "helper.token")
+LOG_PATH = os.path.join(DATA_DIR, "helper.log")
+PORT = 5178
+NOWIN = 0x08000000
+
+log = logging.getLogger("helper")
+h = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=300_000, backupCount=1, encoding="utf-8")
+h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+log.addHandler(h)
+log.setLevel(logging.INFO)
+
+FULL_BLAST = ([20, 30, 40, 50, 60, 70, 80, 90], [100] * 8)
+
+
+def is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+class Hardware:
+    def __init__(self):
+        self.asus = None
+        self.mode = None
+        self.full_fans_until = 0
+        self.lock = threading.Lock()
+        try:
+            from power.asus_acpi import AsusAcpi
+            self.asus = AsusAcpi()
+            log.info("ASUS ATKACPI open; firmware mode read: %s", self.asus.get_mode())
+        except Exception as e:
+            log.info("no ASUS firmware control: %s", e)
+        self.ryzenadj = next((p for p in (os.path.join(APP_DIR, "tools", "ryzenadj.exe"),
+                                          os.path.join(APP_DIR, "tools", "ryzenadj", "ryzenadj.exe"))
+                              if os.path.exists(p)), None)
+
+    def status(self):
+        out = {"admin": is_admin(), "asus": self.asus is not None, "mode": self.mode,
+               "ryzenadj": bool(self.ryzenadj), "full_fans": time.time() < self.full_fans_until}
+        if self.asus:
+            with self.lock:
+                try:
+                    out["cpu_temp"] = self.asus.get_cpu_temp()
+                    out["gpu_temp"] = self.asus.get_gpu_temp() or None
+                    out["fans"] = self.asus.get_fan_rpm()
+                except Exception as e:
+                    out["error"] = str(e)
+        return out
+
+    def set_mode(self, name, boost=None, ryzenadj_args=""):
+        """silent / balanced / turbo / boost (= turbo + PPT + fan curve)."""
+        res = {"asus": None, "ryzenadj": None}
+        if self.asus and name in ("silent", "balanced", "turbo", "boost"):
+            with self.lock:
+                base = "turbo" if name == "boost" else name
+                ok = self.asus.set_mode(base)
+                if time.time() < self.full_fans_until:
+                    time.sleep(0.3)           # a mode write resets the curve: put full fans back
+                    self.asus.set_fan_curves(*FULL_BLAST)
+                if name == "boost" and boost:
+                    time.sleep(0.3)           # mode writes reset the firmware curves
+                    ppt = self.asus.set_ppt(boost.get("ppt_total_w"), boost.get("ppt_apu_w"))
+                    fans = self.asus.set_fan_curves(boost.get("fan_temps"), boost.get("fan_speeds"))
+                    res["boost"] = {"ppt": ppt, "fans": fans}
+                res["asus"] = ok
+                self.mode = name
+        if self.ryzenadj and ryzenadj_args:
+            try:
+                r = subprocess.run([self.ryzenadj] + ryzenadj_args.split(), capture_output=True, text=True,
+                                   timeout=10, creationflags=NOWIN)
+                res["ryzenadj"] = r.returncode == 0
+            except Exception as e:
+                res["ryzenadj"] = str(e)
+        log.info("mode %s -> %s", name, res)
+        return res
+
+    def fans(self, full=None, temps=None, speeds=None, minutes=3):
+        if not self.asus:
+            return {"asus": False}
+        with self.lock:
+            if full:
+                ok = self.asus.set_fan_curves(*FULL_BLAST)
+                self.full_fans_until = time.time() + minutes * 60
+                threading.Timer(minutes * 60 + 1, self._end_full_fans).start()
+            elif temps and speeds:
+                ok = self.asus.set_fan_curves(temps, speeds)
+            else:
+                ok = False
+        log.info("fans full=%s -> %s", full, ok)
+        return {"ok": ok}
+
+    def _end_full_fans(self):
+        if time.time() >= self.full_fans_until and self.mode:
+            self.full_fans_until = 0
+            self.set_mode(self.mode)            # a mode write puts the firmware curve back
+
+
+PRIV_PS = r"""
+$o = [ordered]@{}
+try { $o.bitlocker = @(Get-BitLockerVolume -ErrorAction Stop | % { [pscustomobject]@{ mount=$_.MountPoint; status=[string]$_.ProtectionStatus; pct=$_.EncryptionPercentage } }) } catch { $o.bitlocker = "unavailable: $($_.Exception.Message)" }
+try { $o.secure_boot = Confirm-SecureBootUEFI -ErrorAction Stop } catch { $o.secure_boot = "unavailable" }
+try { $o.smb1 = (Get-SmbServerConfiguration -ErrorAction Stop).EnableSMB1Protocol } catch { $o.smb1 = "unavailable" }
+try { $o.lsa_ppl = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -ErrorAction Stop).RunAsPPL } catch { $o.lsa_ppl = $null }
+try { $o.tpm = (Get-Tpm -ErrorAction Stop | select TpmPresent,TpmReady,TpmEnabled) } catch { $o.tpm = "unavailable" }
+try { $o.defender_tamper = (Get-MpComputerStatus -ErrorAction Stop).IsTamperProtected } catch { $o.defender_tamper = $null }
+$o | ConvertTo-Json -Compress -Depth 4
+"""
+
+
+def privileged_security():
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", PRIV_PS],
+                           capture_output=True, text=True, timeout=90, creationflags=NOWIN)
+        return json.loads(r.stdout.strip() or "{}")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+class Handler(BaseHTTPRequestHandler):
+    hw = None
+    token = None
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _auth(self):
+        if self.headers.get("X-Token") != self.token:
+            self._send(403, {"error": "bad token"})
+            return False
+        return True
+
+    def do_GET(self):
+        if self.path == "/ping":
+            return self._send(200, {"ok": True})
+        if not self._auth():
+            return
+        if self.path == "/status":
+            return self._send(200, self.hw.status())
+        if self.path == "/security":
+            return self._send(200, privileged_security())
+        self._send(404, {"error": "no such path"})
+
+    def do_POST(self):
+        if not self._auth():
+            return
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            data = json.loads(self.rfile.read(n).decode() or "{}")
+        except Exception:
+            data = {}
+        if self.path == "/mode":
+            return self._send(200, self.hw.set_mode(data.get("name"), data.get("boost"), data.get("ryzenadj", "")))
+        if self.path == "/fans":
+            return self._send(200, self.hw.fans(data.get("full"), data.get("temps"), data.get("speeds"),
+                                                data.get("minutes", 3)))
+        if self.path == "/quit":
+            self._send(200, {"ok": True})
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
+        self._send(404, {"error": "no such path"})
+
+
+def main():
+    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\LightsOutHelper")
+    if ctypes.windll.kernel32.GetLastError() == 183:
+        return
+    token = secrets.token_hex(24)
+    with open(TOKEN_PATH, "w", encoding="utf-8") as f:
+        f.write(token)
+    Handler.hw = Hardware()
+    Handler.token = token
+    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    log.info("helper listening on 127.0.0.1:%s admin=%s asus=%s", PORT, is_admin(), Handler.hw.asus is not None)
+    try:
+        srv.serve_forever()
+    finally:
+        try:
+            os.remove(TOKEN_PATH)
+        except OSError:
+            pass
+        ctypes.windll.kernel32.ReleaseMutex(mutex)
+
+
+if __name__ == "__main__":
+    main()

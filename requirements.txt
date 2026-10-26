@@ -1,0 +1,5 @@
+pystray>=0.19
+Pillow>=10
+psutil>=5.9
+pywin32>=306
+pyinstaller>=6 ; extra == "build"

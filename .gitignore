@@ -1,0 +1,19 @@
+# build output
+build/
+dist/
+__pycache__/
+*.pyc
+
+# runtime files that older versions wrote next to the app (now in %LOCALAPPDATA%\LightsOut)
+config.json
+state.json
+*.log
+.open-panel
+location.json
+
+# optional third-party tools dropped in by the user
+tools/*.exe
+tools/*/
+
+# screenshots taken by panel_shot.py outside docs/
+/*.png
