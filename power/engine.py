@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 from . import sensors as S
@@ -86,18 +87,29 @@ class HelperClient:
         if not tok:
             self.ok = False
             return None
-        req = urllib.request.Request(self.base + path, method="POST" if data is not None else "GET",
-                                     headers={"X-Token": tok, "Content-Type": "application/json"},
-                                     data=json.dumps(data).encode() if data is not None else None)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                self.ok = True
-                return json.loads(r.read().decode())
-        except Exception as e:
-            if self.ok:
-                log.warning("helper call %s failed: %s", path, e)
-            self.ok = False
-            return None
+        body = json.dumps(data).encode() if data is not None else None
+        for attempt in (0, 1):
+            req = urllib.request.Request(self.base + path, method="POST" if data is not None else "GET",
+                                         headers={"X-Token": tok, "Content-Type": "application/json"}, data=body)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    self.ok = True
+                    return json.loads(r.read().decode())
+            except urllib.error.HTTPError as e:
+                if e.code == 403 and attempt == 0:
+                    # the helper was restarted and wrote a new token: re-read it and try once more
+                    self.token = None
+                    tok = self._token()
+                    if tok:
+                        continue
+                log.warning("helper call %s failed: HTTP %s", path, e.code)
+                self.ok = False
+                return None
+            except Exception as e:
+                if self.ok:
+                    log.warning("helper call %s failed: %s", path, e)
+                self.ok = False
+                return None
 
     def ensure_running(self):
         """Start the helper: through its elevated scheduled task when installed,

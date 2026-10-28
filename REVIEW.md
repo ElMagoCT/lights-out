@@ -123,6 +123,43 @@ every 20 s.
 - `claude -p` is driven with a cleaned environment so it never inherits a
   parent Claude Code session's variables.
 
+## Incident, 2026-10-25 to 27: hung while asleep
+
+Sleep mode was entered at 23:15 on the 25th. Forty-two hours later the user
+came back to dark monitors, found the black overlay windows "not responding"
+and closed the program from the Windows dialog (Application log, event 1002,
+AppHangB1). No wake had ever been logged. Consequences: the taskbar stayed
+hidden (it is hidden by the app and shown again on wake), the monitors stayed
+at the sleep brightness, and the desktop was open without a password, because
+the first version locked Windows on wake rather than on sleep. The hang itself
+left no stack; Python-level exceptions would have been logged, so it was a
+blocking call or a deadlock on the UI thread.
+
+What changed:
+- **Lock at sleep, not at wake** (default on). Windows itself now guarantees
+  the password, whatever happens to the app afterwards. On the lock screen
+  Windows Hello handles the fingerprint; the unlock wakes the screens.
+- **A watchdog in the helper process.** While asleep the tray app registers
+  its pid, a heartbeat file its UI thread touches every 2 s, and the saved
+  brightness. If the tray dies or the heartbeat goes stale for 20 s, the
+  helper locks Windows, shows the taskbar, wakes the monitors, restores
+  brightness and ends the hung process. Verified with a killed and with a
+  frozen dummy process: recovery in 7 s and 10 s.
+- **A sentinel file** (`asleep.json`) that a fresh start uses to repair the
+  same things if both processes were gone.
+- **A hang detector inside the app** that dumps every thread's stack to
+  `crash.log` after 20 s of UI silence (plus `faulthandler` for hard crashes),
+  so the next hang is diagnosable, and does the same recovery from inside.
+- **No blocking calls on the UI thread any more.** DDC writes at sleep and
+  wake, and the WinBio cancel/close, moved to worker threads.
+- **Re-sleep timer.** A key press on the lock screen turns the monitors on;
+  if nobody signs in within three minutes they go dark again.
+- **Sun sync could pin brightness at the floor.** If a slider sat at 0 when
+  the curve was anchored, the stored day level became 0 and every tick set
+  2 %. The anchor now has a floor of 10 and a zero is treated as unset.
+- The helper token is re-read after a 403, so a restarted helper is picked up
+  without restarting the tray app (found by the self-test).
+
 ## Open items
 
 - Confirm the fingerprint wake with a real touch on another unit.

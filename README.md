@@ -25,12 +25,21 @@ computed locally from your location (detected once, or typed in), the level
 you set by day is scaled down at night by the strength you chose, with a
 smooth transition around dawn and dusk.
 
-**Sleep.** Every monitor goes black, brightness to 0, then DDC/CI standby;
-the taskbar hides; all input is swallowed; the PC is held awake so Windows'
-own sleep never kicks in. **Wake** = two presses within five seconds, where a
-press is any key or any mouse button (movement never counts), or a touch on
-the fingerprint reader. Key and click wakes lock Windows first so you land on
-the lock screen; a matched fingerprint goes straight to the desktop.
+**Sleep.** Windows locks, every monitor goes black, brightness to 0, then
+DDC/CI standby; the taskbar hides; the PC is held awake so Windows' own sleep
+never kicks in. **Wake** = signing in (Windows Hello fingerprint or password)
+brings the screens back, and so do two presses within five seconds, where a
+press is any key or any mouse button (movement never counts). If the screens
+come on and nobody signs in, they go dark again after three minutes. Locking
+at sleep is a switch in Settings; off, the desktop stays unlocked behind the
+black screens, keys and clicks are swallowed, the app's own fingerprint
+session wakes it, and Windows is locked on the way out instead.
+
+**Safety net.** While asleep the tray app heartbeats to the helper. If it
+ever dies or hangs, the helper locks Windows, shows the taskbar, wakes the
+monitors and restores brightness within about ten seconds; a fresh start does
+the same from a sentinel file; and a hang dumps every thread's stack to
+`crash.log`.
 
 **Power engine.** Every two seconds it samples CPU, GPU, temperatures, fans,
 battery, idle time, the foreground app (fullscreen? on the GPU?) and the

@@ -84,6 +84,27 @@ def last_input_tick():
     return li.dwTime
 
 
+def wts_last_input():
+    """The session's LastInputTime from Terminal Services (FILETIME), or None.
+    Polled alongside GetLastInputInfo on the lock screen: whichever of the two
+    the secure desktop still updates is enough to notice a key press."""
+    try:
+        buf, n = ctypes.c_void_p(), wt.DWORD()
+        if not wtsapi.WTSQuerySessionInformationW(None, wt.DWORD(0xFFFFFFFF), 25, ctypes.byref(buf), ctypes.byref(n)):
+            return None
+        try:
+            return ctypes.cast(buf, ctypes.POINTER(WTSINFOEX)).contents.Data.LastInputTime
+        finally:
+            wtsapi.WTSFreeMemory(buf)
+    except Exception:
+        return None
+
+
+def input_stamp():
+    """Combined 'something was pressed' stamp: changes when either source changes."""
+    return (last_input_tick(), wts_last_input())
+
+
 class WakeGate:
     """Install with start(on_wake); stop() tears the hooks down."""
 
@@ -191,15 +212,16 @@ class WakeGate:
         is one short burst; a mouse wiggle is one long burst), and always wake
         when the session unlocks."""
         was_locked = False
-        last = last_input_tick()
+        last = input_stamp()
         bursts = []
         burst_open = None
+        burst_last = 0.0
         while self.active:
             time.sleep(0.05)
             locked = session_locked()
             if locked and not was_locked:
-                log.info("session locked while asleep: switching to input-burst fallback")
-                last = last_input_tick()
+                log.info("session locked while asleep: counting input bursts on the lock screen")
+                last = input_stamp()
                 bursts, burst_open = [], None
             if was_locked and locked is False:
                 self._fire("session unlocked")
@@ -207,7 +229,7 @@ class WakeGate:
             was_locked = bool(locked)
             if not locked:
                 continue
-            tick = last_input_tick()
+            tick = input_stamp()
             now = time.monotonic()
             if tick != last:
                 last = tick

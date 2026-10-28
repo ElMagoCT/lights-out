@@ -40,13 +40,17 @@ SIGNAL_PATH = os.path.join(DATA_DIR, ".open-panel")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
 GEO_PATH = os.path.join(DATA_DIR, "location.json")
 REPORT_DIR = os.path.join(DATA_DIR, "reports")
+CRASH_PATH = os.path.join(DATA_DIR, "crash.log")        # faulthandler: hard crashes + hang dumps
+HEARTBEAT_PATH = os.path.join(DATA_DIR, "heartbeat")    # touched by the UI thread every 2 s while asleep
+SENTINEL_PATH = os.path.join(DATA_DIR, "asleep.json")   # exists only while asleep: what to put back after a crash
+_crash_file = None
 
 from power import engine as E          # noqa: E402
 import claude_bridge as CB             # noqa: E402
 
 DEFAULTS = {
-    "presses": 2, "window_seconds": 5, "lock_on_wake": True,
-    "wake_on_click": True, "fingerprint_wake": True, "fingerprint_unlocks": True,
+    "presses": 2, "window_seconds": 5, "lock_on_sleep": True, "lock_on_wake": True, "relock_minutes": 3,
+    "wake_on_click": True, "fingerprint_wake": True, "fingerprint_unlocks": False,
     "dim_on_sleep": True, "ddc_standby": True, "hide_taskbar_asleep": True,
     "hotkeys": {"sleep": "ctrl+alt+s", "panel": "ctrl+alt+b",
                 "brightness_up": "ctrl+alt+up", "brightness_down": "ctrl+alt+down"},
@@ -69,6 +73,14 @@ def setup_logging():
     logging.getLogger("lightsout").setLevel(logging.DEBUG)
     if sys.stdout is not None and sys.stdout.isatty():
         logging.getLogger().addHandler(logging.StreamHandler())
+    # hard crashes (access violations) and hang dumps go here with every thread's stack
+    try:
+        import faulthandler
+        global _crash_file
+        _crash_file = open(CRASH_PATH, "a", encoding="utf-8")
+        faulthandler.enable(file=_crash_file, all_threads=True)
+    except Exception:
+        log.exception("faulthandler")
 
 
 def _merge(base, override):
@@ -117,6 +129,7 @@ kernel32 = ctypes.windll.kernel32
 ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED = 0x80000000, 0x1, 0x2
 BG, PANEL, FG, DIM, ACCENT = "#101114", "#1a1c21", "#e8e8ea", "#8a8d96", "#f2c14e"
 PROFILE_LABEL = {"auto": "Auto", "quiet": "Quiet", "balanced": "Balanced", "performance": "Perf", "max": "Max"}
+SUN_DAY_FLOOR = 10      # the sun curve never anchors a "daytime" level below this
 
 
 def make_icon_image(asleep=False):
@@ -295,6 +308,9 @@ class App:
         self.engine = E.Engine(self.cfg["power"], APP_DIR, DATA_DIR, on_change=self._on_profile)
         self.security_busy = False
         self._style()
+        self._recover_from_crash()            # a previous instance died while asleep?
+        self._hb = time.monotonic()           # UI-thread heartbeat for the in-process hang detector
+        threading.Thread(target=self._hang_detector, name="hang-detector", daemon=True).start()
         self.hotkeys = Hotkeys(lambda name: self.post(self.on_hotkey, name))
         self.hotkeys.apply(self.cfg["hotkeys"])
         self.engine.start()
@@ -352,6 +368,7 @@ class App:
         self.q.put((fn, a))
 
     def _pump(self):
+        self._hb = time.monotonic()
         try:
             while True:
                 fn, a = self.q.get_nowait()
@@ -362,6 +379,56 @@ class App:
         except queue.Empty:
             pass
         self.root.after(50, self._pump)
+
+    def _hang_detector(self):
+        """If the UI thread stops pumping for 20 s, dump every thread's stack to
+        crash.log so the next hang is diagnosable, and undo sleep's side
+        effects from here (the helper's watchdog does the same from outside)."""
+        import faulthandler
+        dumped = False
+        while True:
+            time.sleep(5)
+            stale = time.monotonic() - self._hb
+            if stale < 20:
+                dumped = False
+                continue
+            if not dumped:
+                log.error("UI thread unresponsive for %.0f s: dumping stacks to crash.log", stale)
+                try:
+                    _crash_file.write(f"\n=== UI thread hang {dt.datetime.now():%Y-%m-%d %H:%M:%S}, {stale:.0f}s ===\n")
+                    _crash_file.flush()
+                    faulthandler.dump_traceback(file=_crash_file, all_threads=True)
+                    _crash_file.flush()
+                except Exception:
+                    pass
+                dumped = True
+                if self.asleep:
+                    user32.LockWorkStation()          # the gate can no longer be trusted: Windows takes over
+                    for h in taskbar_windows():
+                        user32.ShowWindow(h, 5)
+                    self.gate.stop()
+                    threading.Thread(target=self._restore, args=(self.monitors, dict(self.saved)), daemon=True).start()
+
+    def _recover_from_crash(self):
+        """Runs at startup. If asleep.json is there, the last instance died in
+        sleep mode: show the taskbar, wake the monitors, put brightness back."""
+        for h in taskbar_windows():
+            if not user32.IsWindowVisible(h):
+                user32.ShowWindow(h, 5)
+                log.warning("taskbar was hidden at startup: shown")
+        if not os.path.exists(SENTINEL_PATH):
+            return
+        try:
+            with open(SENTINEL_PATH, encoding="utf-8") as f:
+                st = json.load(f)
+            os.remove(SENTINEL_PATH)
+            log.warning("previous instance died while asleep (since %s): restoring monitors", st.get("since"))
+            mons = mon.enumerate_monitors(probe_wmi=False)
+            for m in mons:
+                m.power(True)
+            threading.Thread(target=self._restore, args=(mons, st.get("saved", {})), daemon=True).start()
+        except Exception:
+            log.exception("crash recovery")
 
     def _poll_signal(self):
         if os.path.exists(SIGNAL_PATH):
@@ -498,9 +565,11 @@ class App:
                 if not controllable(m):
                     continue
                 day = self.sun_day.get(m.device)
-                if day is None:
+                if not day or day < SUN_DAY_FLOOR:
+                    # unset, or anchored while the slider sat near zero: a day level that low
+                    # would pin the monitor at the floor forever (it happened once)
                     cur = level_get(m)
-                    day = self.sun_day[m.device] = min(100, round((cur if cur is not None else 60) / max(f, 0.05)))
+                    day = self.sun_day[m.device] = self._anchor_day(cur if cur is not None else 60, f)
                 target = max(2, round(day * f))
                 if self.last.get(m.device) != target:
                     level_set(m, target)
@@ -670,11 +739,16 @@ class App:
         hk = self.cfg["hotkeys"]
         sec = self.cfg["security"]
         inputs = "key presses or clicks" if self.cfg.get("wake_on_click", True) else "key presses"
-        fp = (", or a fingerprint" + (" (straight to the desktop)" if self.cfg.get("fingerprint_unlocks", True) else "")
-              if self.cfg.get("fingerprint_wake", True) and self.fp.available() else "")
-        foot = (f"Wakes on {self.cfg['presses']} {inputs} within {self.cfg['window_seconds']:g} s{fp}. "
-                f"Mouse movement never wakes it.  Hotkeys: {hk.get('sleep')} sleep, {hk.get('panel')} panel, "
-                f"{hk.get('brightness_up')} / {hk.get('brightness_down')} brightness.")
+        if self.cfg.get("lock_on_sleep", True):
+            fp = " or a Windows Hello fingerprint" if self.fp.available() else ""
+            foot = (f"Locks Windows, then wakes the screens on {self.cfg['presses']} {inputs} within "
+                    f"{self.cfg['window_seconds']:g} s{fp}; your password or fingerprint gets you back in. ")
+        else:
+            fp = (", or a fingerprint" + (" (straight to the desktop)" if self.cfg.get("fingerprint_unlocks", False) else "")
+                  if self.cfg.get("fingerprint_wake", True) and self.fp.available() else "")
+            foot = f"Wakes on {self.cfg['presses']} {inputs} within {self.cfg['window_seconds']:g} s{fp}, to the lock screen. "
+        foot += (f"Mouse movement never wakes it.  Hotkeys: {hk.get('sleep')} sleep, {hk.get('panel')} panel, "
+                 f"{hk.get('brightness_up')} / {hk.get('brightness_down')} brightness.")
         if sec.get("last_summary"):
             foot += f"\nSecurity ({sec.get('last_run', '')[:10]}): {sec['last_summary']}."
         ttk.Label(f, text=foot, style="Dim.TLabel", wraplength=360).grid(row=r, column=0, columnspan=3, sticky="w")
@@ -729,13 +803,19 @@ class App:
         self.pressure_bar["value"] = pr
         self.pressure_lab.config(text=f"{pr}%" + (" (near limit)" if pr >= self.cfg["power"].get("max_load", 85) else ""))
 
+    @staticmethod
+    def _anchor_day(level, factor):
+        """Day level that makes the curve pass through `level` right now, never
+        below SUN_DAY_FLOOR so the monitors can always come back up."""
+        return max(SUN_DAY_FLOOR, min(100, round(level / max(factor, 0.05))))
+
     def _toggle_sun(self):
         self.cfg["sun"]["enabled"] = bool(self.sun_var.get())
         if self.cfg["sun"]["enabled"]:
             self.sun_day = {}
             f = self._sun_factor()
             for m, val, lab, sc in self.rows:
-                self.sun_day[m.device] = min(100, round(int(val.get()) / max(f, 0.05)))
+                self.sun_day[m.device] = self._anchor_day(int(val.get()), f)
         save_config(self.cfg)
         self._save_state()
         self.root.after(200, self._sun_tick_now)
@@ -807,7 +887,7 @@ class App:
         self.writer.submit((m.device, "level"), lambda m=m, v=v: level_set(m, v))
         self.last[m.device] = v
         if self.cfg["sun"].get("enabled"):
-            self.sun_day[m.device] = min(100, round(v / max(self._sun_factor(), 0.05)))
+            self.sun_day[m.device] = self._anchor_day(v, self._sun_factor())
 
     def _slide(self, m, val, lab, _depth=0):
         v = int(max(0, min(100, int(float(val.get())))))
@@ -855,14 +935,22 @@ class App:
         r = row(f, r, "Wake after this many key presses", ttk.Spinbox(f, from_=1, to=5, width=5, textvariable=v["presses"]))
         r = row(f, r, "...within this many seconds", ttk.Spinbox(f, from_=1, to=30, width=5, textvariable=v["window_seconds"]))
         v["lock_on_wake"] = tk.BooleanVar(value=cfg["lock_on_wake"]); v["hide_taskbar_asleep"] = tk.BooleanVar(value=cfg.get("hide_taskbar_asleep", True))
-        ttk.Checkbutton(f, text="Lock Windows when waking (opens to the lock screen)", variable=v["lock_on_wake"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        v["lock_on_sleep"] = tk.BooleanVar(value=cfg.get("lock_on_sleep", True))
+        v["relock_minutes"] = tk.IntVar(value=int(cfg.get("relock_minutes", 3)))
+        ttk.Checkbutton(f, text="Lock Windows the moment it sleeps (password or Windows Hello to get back in, "
+                                "even if this app dies)", variable=v["lock_on_sleep"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        r = row(f, r, "If woken onto the lock screen and nobody signs in, go dark again after (minutes, 0 = never)",
+                ttk.Spinbox(f, from_=0, to=60, width=5, textvariable=v["relock_minutes"]))
+        ttk.Checkbutton(f, text="Otherwise lock Windows when waking (opens to the lock screen)", variable=v["lock_on_wake"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
         v["wake_on_click"] = tk.BooleanVar(value=cfg.get("wake_on_click", True))
         v["fingerprint_wake"] = tk.BooleanVar(value=cfg.get("fingerprint_wake", True))
         v["fingerprint_unlocks"] = tk.BooleanVar(value=cfg.get("fingerprint_unlocks", True))
         ttk.Checkbutton(f, text="Mouse clicks count as presses too (movement never wakes)", variable=v["wake_on_click"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
         fp_note = f" ({self.fp.description})" if self.fp.available() else " (no fingerprint reader found)"
-        ttk.Checkbutton(f, text="Fingerprint wakes" + fp_note, variable=v["fingerprint_wake"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
-        ttk.Checkbutton(f, text="A matched fingerprint goes straight to the desktop (no lock screen)", variable=v["fingerprint_unlocks"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        ttk.Checkbutton(f, text="Fingerprint wakes" + fp_note + "  (when locked at sleep, Windows Hello on the lock screen does this)",
+                        variable=v["fingerprint_wake"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        ttk.Checkbutton(f, text="...and a matched fingerprint on an unlocked desktop skips the lock screen",
+                        variable=v["fingerprint_unlocks"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
         ttk.Checkbutton(f, text="Hide the taskbar while asleep", variable=v["hide_taskbar_asleep"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
         ttk.Label(f, text="Hotkeys  (e.g. ctrl+alt+s, ctrl+shift+f9, win+pause)", style="Section.TLabel").grid(row=r, column=0, columnspan=2, sticky="w", pady=(14, 2)); r += 1
         v["hotkeys"] = {}
@@ -1009,6 +1097,7 @@ class App:
             cfg["lock_on_wake"] = bool(v["lock_on_wake"].get()); cfg["hide_taskbar_asleep"] = bool(v["hide_taskbar_asleep"].get())
             cfg["wake_on_click"] = bool(v["wake_on_click"].get()); cfg["fingerprint_wake"] = bool(v["fingerprint_wake"].get())
             cfg["fingerprint_unlocks"] = bool(v["fingerprint_unlocks"].get())
+            cfg["lock_on_sleep"] = bool(v["lock_on_sleep"].get()); cfg["relock_minutes"] = max(0, int(v["relock_minutes"].get()))
             cfg["brightness_step"] = max(1, int(v["brightness_step"].get()))
             cfg["hotkeys"] = {k: var.get().strip() for k, var in v["hotkeys"].items()}
             pw = cfg["power"]
@@ -1057,6 +1146,12 @@ class App:
             self.icon.title = "Lights Out - asleep (press any key twice to wake)"
         self.refresh_monitors()
         kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+        lock_now = self.cfg.get("lock_on_sleep", True) and not self.selftest
+        if lock_now:
+            # Lock first: a password (or Windows Hello) is required to get back in no
+            # matter what happens to this process afterwards.
+            if not user32.LockWorkStation():
+                log.warning("LockWorkStation failed: %s", ctypes.get_last_error())
         if self.cfg.get("hide_taskbar_asleep", True):
             self.hidden_taskbars = taskbar_windows()
             for h in self.hidden_taskbars:
@@ -1072,7 +1167,9 @@ class App:
             self.overlays.append(o)
         self.root.update()
         self.gate.start(lambda why: self.post(self.wake, why))
-        if self.cfg.get("fingerprint_wake", True) and self.fp.available():
+        # Our own fingerprint session only when the desktop stays unlocked; on the
+        # lock screen Windows Hello owns the sensor and the unlock itself wakes us.
+        if not lock_now and self.cfg.get("fingerprint_wake", True) and self.fp.available():
             if not self.fp.start(lambda why: self.post(self.wake, why)):
                 log.warning("fingerprint wake not armed (sensor busy?)")
         self.saved = {}
@@ -1083,22 +1180,50 @@ class App:
             if m.hdr:
                 entry["sdr_nits"] = m.sdr_white_nits()
             self.saved[m.device] = entry
-            if self.cfg["dim_on_sleep"]:
-                if m.ddc or m.wmi:
-                    m.set(m.min)
-                if m.hdr:
-                    m.set_sdr_white_nits(mon.SDR_MIN_NITS)
-        if self.cfg["ddc_standby"]:
-            time.sleep(0.2)
-            for m in self.monitors:
-                m.power(False)
+        self._touch_heartbeat()
+        self._write_sentinel()
+        self.engine.helper.call("/asleep", {"pid": os.getpid(), "heartbeat": HEARTBEAT_PATH, "saved": self.saved})
+        # the DDC writes can stall on a monitor that is half asleep: keep them off the UI thread
+        threading.Thread(target=self._lights_off, args=(list(self.monitors),), name="lights-off", daemon=True).start()
         self.root.after(2000, self._asleep_tick)
-        log.info("asleep; saved %s", self.saved)
+        log.info("asleep (locked=%s); saved %s", lock_now, self.saved)
+
+    def _lights_off(self, mons):
+        try:
+            for m in mons:
+                if self.cfg["dim_on_sleep"]:
+                    if m.ddc or m.wmi:
+                        m.set(m.min)
+                    if m.hdr:
+                        m.set_sdr_white_nits(mon.SDR_MIN_NITS)
+            if self.cfg["ddc_standby"]:
+                time.sleep(0.2)
+                for m in mons:
+                    m.power(False)
+        except Exception:
+            log.exception("lights off")
+
+    def _touch_heartbeat(self):
+        try:
+            with open(HEARTBEAT_PATH, "a"):
+                pass
+            os.utime(HEARTBEAT_PATH, None)
+        except OSError:
+            pass
+
+    def _write_sentinel(self):
+        try:
+            with open(SENTINEL_PATH, "w", encoding="utf-8") as f:
+                json.dump({"since": dt.datetime.now().isoformat(timespec="seconds"), "pid": os.getpid(),
+                           "saved": self.saved}, f)
+        except OSError:
+            log.exception("sentinel")
 
     def _asleep_tick(self):
         """Keep the black overlays on top of anything that pops up (toasts, the taskbar)."""
         if not self.asleep:
             return
+        self._touch_heartbeat()
         for o in self.overlays:
             try:
                 o.lift()
@@ -1113,16 +1238,27 @@ class App:
         log.info("=== wake (%s) ===", why)
         self.last_wake_why = why
         self.gate.stop()
-        self.fp.stop()
-        # a matched fingerprint is already an authentication: straight to the desktop
-        skip_lock = why == "fingerprint" and self.cfg.get("fingerprint_unlocks", True)
-        if self.cfg["lock_on_wake"] and not skip_lock and not self.selftest:
+        if self.fp.active or self.fp._sess is not None:
+            threading.Thread(target=self.fp.stop, name="fp-stop", daemon=True).start()   # WinBio calls never on the UI thread
+        locked_now = bool(session_locked())
+        # a matched fingerprint on an unlocked desktop is already an authentication
+        skip_lock = why == "fingerprint" and self.cfg.get("fingerprint_unlocks", False)
+        if self.cfg["lock_on_wake"] and not skip_lock and not locked_now and not self.selftest:
             if not user32.LockWorkStation():
                 log.warning("LockWorkStation failed: %s", ctypes.get_last_error())
-        for m in self.monitors:
-            m.power(True)
-        threading.Thread(target=self._restore, args=(self.monitors, dict(self.saved)), name="restore", daemon=True).start()
+        mons, saved = self.monitors, dict(self.saved)
+        threading.Thread(target=self._lights_on, args=(mons, saved), name="restore", daemon=True).start()
         self.monitors = []
+        try:
+            os.remove(SENTINEL_PATH)
+        except OSError:
+            pass
+        self.engine.helper.call("/awake", {})
+        if locked_now and why != "session unlocked":
+            # woke onto the lock screen (a key, a click): if nobody signs in, go dark again
+            mins = float(self.cfg.get("relock_minutes", 3) or 0)
+            if mins > 0:
+                self.root.after(int(mins * 60_000), self._resleep_if_still_locked)
         for o in self.overlays:
             try:
                 o.destroy()
@@ -1139,6 +1275,19 @@ class App:
             self.icon.icon = make_icon_image()
             self.icon.title = "Lights Out"
         log.info("awake")
+
+    def _lights_on(self, mons, saved):
+        for m in mons:
+            try:
+                m.power(True)
+            except Exception:
+                log.exception("power on")
+        self._restore(mons, saved)
+
+    def _resleep_if_still_locked(self):
+        if not self.asleep and session_locked():
+            log.info("still on the lock screen after the wake: going dark again")
+            self.sleep()
 
     def _restore(self, mons, saved):
         deadline = time.monotonic() + 15
@@ -1242,6 +1391,9 @@ def selftest(app):
         result["asleep"] = app.asleep
         result["fingerprint_armed"] = app.fp.active if app.fp.available() else "n/a"
         result["taskbar_hidden"] = all(not user32.IsWindowVisible(h) for h in app.hidden_taskbars) and bool(app.hidden_taskbars)
+        result["sentinel_written"] = os.path.exists(SENTINEL_PATH)
+        result["heartbeat_fresh"] = os.path.exists(HEARTBEAT_PATH) and time.time() - os.path.getmtime(HEARTBEAT_PATH) < 5
+        result["watchdog_armed"] = bool((app.engine.helper.call("/status") or {}).get("watchdog"))
         result["dimmed"] = {m.device: (m.brightness, m.sdr_white_nits() if m.hdr else None) for m in app.monitors}
         inject_click()
         app.root.after(800, step3)
@@ -1254,6 +1406,7 @@ def selftest(app):
         result["awake_after_two_clicks"] = not app.asleep
         result["click_wake_reason"] = app.last_wake_why
         result["fingerprint_disarmed"] = (not app.fp.active) if app.fp.available() else "n/a"
+        result["sentinel_cleared"] = not os.path.exists(SENTINEL_PATH)
         app.root.after(2500, step5)
 
     def step5():                                           # sleep #2: two key taps must wake it
@@ -1278,7 +1431,8 @@ def selftest(app):
             time.sleep(0.5)
         result["restored"] = after == before
         result["before"], result["after"] = before, after
-        checks = ("awake_after_two_clicks", "awake_after_two_taps", "restored", "panel_via_hotkey", "taskbar_hidden", "taskbar_back")
+        checks = ("awake_after_two_clicks", "awake_after_two_taps", "restored", "panel_via_hotkey", "taskbar_hidden", "taskbar_back",
+                  "sentinel_written", "sentinel_cleared", "heartbeat_fresh", "watchdog_armed")
         result["ok"] = all(result.get(k) for k in checks) and result.get("fingerprint_armed") in (True, "n/a") \
             and result.get("fingerprint_disarmed") in (True, "n/a")
         print(json.dumps(result, indent=2))

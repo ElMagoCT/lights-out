@@ -15,6 +15,7 @@ app can read it). What needs elevation lives here and nowhere else:
 Nothing here loops or polls: it sleeps on the socket until asked.
 """
 import ctypes
+import ctypes.wintypes
 import json
 import logging
 import logging.handlers
@@ -128,6 +129,111 @@ class Hardware:
             self.set_mode(self.mode)            # a mode write puts the firmware curve back
 
 
+class Watchdog:
+    """While the tray app is asleep it registers here with its pid, a heartbeat
+    file its UI thread touches every 2 s, the taskbar windows it hid and the
+    brightness it saved. If the tray dies or stops heartbeating (it hung once
+    for 42 hours and left the taskbar hidden), this thread puts everything
+    back: taskbar shown, monitors out of standby, brightness restored, and the
+    hung process ended so its hooks and black overlays go away."""
+
+    STILL_ACTIVE = 259
+
+    def __init__(self):
+        self.state = None
+        self.lock = threading.Lock()
+        threading.Thread(target=self._run, name="watchdog", daemon=True).start()
+
+    def asleep(self, data):
+        with self.lock:
+            self.state = dict(data, since=time.time())
+        log.info("watchdog armed for pid %s", data.get("pid"))
+
+    def awake(self):
+        with self.lock:
+            self.state = None
+        log.info("watchdog disarmed")
+
+    @staticmethod
+    def _alive(pid):
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        try:
+            code = ctypes.wintypes.DWORD()
+            ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+            return code.value == Watchdog.STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+
+    def _run(self):
+        while True:
+            time.sleep(5)
+            with self.lock:
+                st = self.state
+            if not st:
+                continue
+            pid = st.get("pid")
+            hb = st.get("heartbeat", "")
+            try:
+                stale = (time.time() - os.path.getmtime(hb)) if hb and os.path.exists(hb) else 0
+            except OSError:
+                stale = 0
+            dead = not self._alive(pid)
+            if not dead and stale < 20:
+                continue
+            log.warning("tray app %s while asleep (pid %s, heartbeat %.0fs old): restoring",
+                        "died" if dead else "stopped responding", pid, stale)
+            self.restore(st, kill=not dead)
+            with self.lock:
+                self.state = None
+
+    def restore(self, st, kill=False):
+        if kill:
+            h = ctypes.windll.kernel32.OpenProcess(0x0001, False, int(st["pid"]))   # PROCESS_TERMINATE
+            if h:
+                ctypes.windll.kernel32.TerminateProcess(h, 1)
+                ctypes.windll.kernel32.CloseHandle(h)
+                log.info("terminated hung tray app %s", st["pid"])
+        # the tray app can no longer guard the desktop: make Windows ask for the password
+        log.info("LockWorkStation -> %s", ctypes.windll.user32.LockWorkStation())
+        show_taskbars()
+        try:
+            import monitors as mon
+            saved = st.get("saved", {})
+            for m in mon.enumerate_monitors(probe_wmi=False):
+                m.power(True)
+            time.sleep(1.5)
+            for m in mon.enumerate_monitors(probe_wmi=False):
+                entry = saved.get(m.device, {})
+                if entry.get("sdr_nits"):
+                    m.set_sdr_white_nits(entry["sdr_nits"])
+                if entry.get("backlight") is not None and (m.ddc or m.wmi):
+                    m.set(entry["backlight"])
+                m.close()
+            log.info("monitors restored: %s", saved)
+        except Exception:
+            log.exception("monitor restore")
+
+
+def show_taskbars():
+    user32 = ctypes.windll.user32
+    buf = ctypes.create_unicode_buffer(64)
+    n = [0]
+
+    @ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+    def cb(hwnd, _):
+        user32.GetClassNameW(hwnd, buf, 64)
+        if buf.value in ("Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+            user32.ShowWindow(hwnd, 5)
+            n[0] += 1
+        return True
+
+    user32.EnumWindows(cb, 0)
+    log.info("taskbars shown: %d", n[0])
+    return n[0]
+
+
 PRIV_PS = r"""
 $o = [ordered]@{}
 try { $o.bitlocker = @(Get-BitLockerVolume -ErrorAction Stop | % { [pscustomobject]@{ mount=$_.MountPoint; status=[string]$_.ProtectionStatus; pct=$_.EncryptionPercentage } }) } catch { $o.bitlocker = "unavailable: $($_.Exception.Message)" }
@@ -152,6 +258,7 @@ def privileged_security():
 class Handler(BaseHTTPRequestHandler):
     hw = None
     token = None
+    watchdog = None
 
     def log_message(self, *a):
         pass
@@ -176,7 +283,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth():
             return
         if self.path == "/status":
-            return self._send(200, self.hw.status())
+            st = self.hw.status()
+            st["watchdog"] = bool(self.watchdog and self.watchdog.state)
+            return self._send(200, st)
         if self.path == "/security":
             return self._send(200, privileged_security())
         self._send(404, {"error": "no such path"})
@@ -194,6 +303,14 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/fans":
             return self._send(200, self.hw.fans(data.get("full"), data.get("temps"), data.get("speeds"),
                                                 data.get("minutes", 3)))
+        if self.path == "/asleep":
+            self.watchdog.asleep(data)
+            return self._send(200, {"ok": True})
+        if self.path == "/awake":
+            self.watchdog.awake()
+            return self._send(200, {"ok": True})
+        if self.path == "/show_taskbars":
+            return self._send(200, {"shown": show_taskbars()})
         if self.path == "/quit":
             self._send(200, {"ok": True})
             threading.Thread(target=self.server.shutdown, daemon=True).start()
@@ -210,6 +327,7 @@ def main():
         f.write(token)
     Handler.hw = Hardware()
     Handler.token = token
+    Handler.watchdog = Watchdog()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     log.info("helper listening on 127.0.0.1:%s admin=%s asus=%s", PORT, is_admin(), Handler.hw.asus is not None)
     try:
