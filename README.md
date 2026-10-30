@@ -116,8 +116,10 @@ data (config, state, logs, reports) goes to `%LOCALAPPDATA%\LightsOut`.
 
 **Packaged:** download `LightsOut.zip` from Releases (or run `python build.py`
 to make it), unzip anywhere, double-click **Install Lights Out.bat** (one UAC
-prompt). That registers the elevated helper task, adds Startup and Desktop
-shortcuts and starts the app. **Uninstall Lights Out.bat** reverses it.
+prompt). That registers the elevated helper task, adds a Desktop shortcut,
+sets the app to start at logon (HKCU Run key) and starts it. **Uninstall
+Lights Out.bat** reverses it. Each launch leaves a breadcrumb in
+`%LOCALAPPDATA%\LightsOut\startup.log`.
 
 **From source:** Python 3.12, `pip install -r requirements.txt`, then
 `pythonw lightsout.pyw`. The same bat works from a checkout.

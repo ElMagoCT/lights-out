@@ -68,11 +68,23 @@ def install():
     out.append(f"helper start: {'ok' if rc == 0 else msg}")
     desktop, startup = shortcut_folders()
     try:
-        for folder in (desktop, startup):
-            make_lnk(folder, "Lights Out", app, app_args, icon)
-        out.append("shortcuts: Desktop + Startup")
+        make_lnk(desktop, "Lights Out", app, app_args, icon)
+        out.append("shortcut: Desktop")
     except Exception as e:
-        out.append(f"shortcuts failed: {e}")
+        out.append(f"shortcut failed: {e}")
+    # autostart through the Run key: Windows logs these launches (Shell-Core
+    # 9707) and runs them reliably; the Startup folder skipped the app once
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0,
+                            winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, "LightsOut", 0, winreg.REG_SZ, f'"{app}" {app_args}'.strip())
+        old = os.path.join(startup, "Lights Out.lnk")
+        if os.path.exists(old):
+            os.remove(old)
+        out.append("autostart: HKCU Run key")
+    except Exception as e:
+        out.append(f"autostart failed: {e}")
     try:
         subprocess.Popen([app] + ([app_args.strip('"')] if app_args else []), cwd=APP_DIR, creationflags=NOWIN)
         out.append("tray app started")
@@ -92,6 +104,14 @@ def uninstall():
         if os.path.exists(p):
             os.remove(p)
             out.append(f"removed {p}")
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0,
+                            winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, "LightsOut")
+        out.append("autostart entry removed")
+    except OSError:
+        pass
     out.append("Runtime data left in %LOCALAPPDATA%\\LightsOut (delete it by hand if you want a clean slate).")
     return out
 

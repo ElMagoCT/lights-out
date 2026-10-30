@@ -45,8 +45,24 @@ HEARTBEAT_PATH = os.path.join(DATA_DIR, "heartbeat")    # touched by the UI thre
 SENTINEL_PATH = os.path.join(DATA_DIR, "asleep.json")   # exists only while asleep: what to put back after a crash
 _crash_file = None
 
-from power import engine as E          # noqa: E402
-import claude_bridge as CB             # noqa: E402
+def _trace(msg):
+    """Startup breadcrumbs that need nothing but the data folder: if the app
+    dies before logging is up (it vanished at one logon), this still shows how far it got."""
+    try:
+        with open(os.path.join(DATA_DIR, "startup.log"), "a", encoding="utf-8") as f:
+            f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} pid {os.getpid()} {msg}\n")
+    except OSError:
+        pass
+
+
+_trace(f"launch argv={sys.argv[1:]} frozen={FROZEN}")
+try:
+    from power import engine as E          # noqa: E402
+    import claude_bridge as CB             # noqa: E402
+except Exception:
+    import traceback
+    _trace("import failed:\n" + traceback.format_exc())
+    raise
 
 DEFAULTS = {
     "presses": 2, "window_seconds": 5, "lock_on_sleep": True, "lock_on_wake": True, "relock_minutes": 3,
@@ -298,6 +314,8 @@ class App:
         self.writer = LatestWriter()
         self.gate = WakeGate(int(self.cfg["presses"]), float(self.cfg["window_seconds"]), clicks=bool(self.cfg.get("wake_on_click", True)))
         self.fp = fingerprint.FingerprintWatcher()
+        self._wake_lock = threading.Lock()
+        self._wake_done = False
         self.last_wake_why = ""
         self.icon = None
         self.link = tk.BooleanVar(value=True)
@@ -369,6 +387,16 @@ class App:
 
     def _pump(self):
         self._hb = time.monotonic()
+        # faulthandler's own C watchdog: if this thread stops pumping for 40 s it
+        # dumps every thread's stack without needing the GIL (the Python-level
+        # hang detector could not run during the second hang)
+        if time.monotonic() - getattr(self, "_fh_armed", 0) > 10:
+            self._fh_armed = time.monotonic()
+            try:
+                import faulthandler
+                faulthandler.dump_traceback_later(40, repeat=False, file=_crash_file)
+            except Exception:
+                pass
         try:
             while True:
                 fn, a = self.q.get_nowait()
@@ -404,10 +432,7 @@ class App:
                 dumped = True
                 if self.asleep:
                     user32.LockWorkStation()          # the gate can no longer be trusted: Windows takes over
-                    for h in taskbar_windows():
-                        user32.ShowWindow(h, 5)
-                    self.gate.stop()
-                    threading.Thread(target=self._restore, args=(self.monitors, dict(self.saved)), daemon=True).start()
+                    self.wake("ui thread hung")       # the whole wake path runs on worker threads
 
     def _recover_from_crash(self):
         """Runs at startup. If asleep.json is there, the last instance died in
@@ -456,7 +481,16 @@ class App:
             pystray.MenuItem("Quit", lambda: self.post(self.quit)),
         )
         self.icon = pystray.Icon("LightsOut", make_icon_image(), "Lights Out", menu)
-        self.icon.run_detached()
+
+        def start():
+            # at logon the taskbar can appear after us; an icon added before it exists is lost
+            for _ in range(120):
+                if user32.FindWindowW("Shell_TrayWnd", None):
+                    break
+                time.sleep(1)
+            self.icon.run_detached()
+            _trace("tray icon added")
+        threading.Thread(target=start, name="tray-start", daemon=True).start()
 
     def _save_state(self):
         self.last["_sun_day"] = self.sun_day
@@ -1134,11 +1168,20 @@ class App:
         log.info("settings saved")
 
     # -- sleep / wake --------------------------------------------------------------
+    # The wake path must not depend on the Tk thread: twice now the UI thread stopped
+    # responding during a long sleep. sleep() is entered on the UI thread (it creates
+    # windows); everything that gets the user back (locking, taskbar, monitors,
+    # brightness, helper) runs on worker threads, and Tk is only asked, best-effort,
+    # to tear its overlay windows down.
     def sleep(self):
         if self.asleep:
             return
+        if threading.current_thread() is not threading.main_thread():
+            self.post(self.sleep)
+            return
         self.hide_panel()
         self.asleep = True
+        self._wake_done = False
         log.info("=== sleep ===")
         self.engine.set_context(asleep=True)
         if self.icon:
@@ -1156,21 +1199,24 @@ class App:
             self.hidden_taskbars = taskbar_windows()
             for h in self.hidden_taskbars:
                 user32.ShowWindow(h, 0)
-        for m in self.monitors:
-            o = tk.Toplevel(self.root, bg="black", cursor="none")
-            o.overrideredirect(True)
-            o.attributes("-topmost", True)
-            l, t, r, b = m.rect
-            o.geometry(f"{r - l}x{b - t}+{l}+{t}")
-            o.deiconify()
-            o.lift()
-            self.overlays.append(o)
-        self.root.update()
-        self.gate.start(lambda why: self.post(self.wake, why))
+        if not lock_now:
+            # black windows only matter while the desktop stays unlocked; on the lock
+            # screen there is nothing to cover, and fewer windows means less to hang
+            for m in self.monitors:
+                o = tk.Toplevel(self.root, bg="black", cursor="none")
+                o.overrideredirect(True)
+                o.attributes("-topmost", True)
+                l, t, r, b = m.rect
+                o.geometry(f"{r - l}x{b - t}+{l}+{t}")
+                o.deiconify()
+                o.lift()
+                self.overlays.append(o)
+            self.root.update()
+        self.gate.start(self.wake)
         # Our own fingerprint session only when the desktop stays unlocked; on the
         # lock screen Windows Hello owns the sensor and the unlock itself wakes us.
         if not lock_now and self.cfg.get("fingerprint_wake", True) and self.fp.available():
-            if not self.fp.start(lambda why: self.post(self.wake, why)):
+            if not self.fp.start(self.wake):
                 log.warning("fingerprint wake not armed (sensor busy?)")
         self.saved = {}
         for m in self.monitors:
@@ -1183,9 +1229,8 @@ class App:
         self._touch_heartbeat()
         self._write_sentinel()
         self.engine.helper.call("/asleep", {"pid": os.getpid(), "heartbeat": HEARTBEAT_PATH, "saved": self.saved})
-        # the DDC writes can stall on a monitor that is half asleep: keep them off the UI thread
         threading.Thread(target=self._lights_off, args=(list(self.monitors),), name="lights-off", daemon=True).start()
-        self.root.after(2000, self._asleep_tick)
+        threading.Thread(target=self._asleep_loop, name="asleep-loop", daemon=True).start()
         log.info("asleep (locked=%s); saved %s", lock_now, self.saved)
 
     def _lights_off(self, mons):
@@ -1219,62 +1264,89 @@ class App:
         except OSError:
             log.exception("sentinel")
 
-    def _asleep_tick(self):
-        """Keep the black overlays on top of anything that pops up (toasts, the taskbar)."""
-        if not self.asleep:
-            return
-        self._touch_heartbeat()
+    def _asleep_loop(self):
+        """Worker thread while asleep: proves the process is alive to the helper's
+        watchdog and keeps the overlays (unlocked mode) on top, asking Tk for the
+        latter without ever waiting on it."""
+        while self.asleep:
+            if time.monotonic() - self._hb < 10:
+                self._touch_heartbeat()          # only while the UI thread is pumping too
+            if self.overlays:
+                try:
+                    self.root.after(0, self._lift_overlays)
+                except Exception:
+                    pass
+            time.sleep(2)
+
+    def _lift_overlays(self):
         for o in self.overlays:
             try:
                 o.lift()
                 o.attributes("-topmost", True)
             except Exception:
                 pass
-        self.root.after(2000, self._asleep_tick)
 
-    def wake(self, why="manual"):
+    def wake(self, why="manual", wait=False):
+        """Thread-safe, idempotent. Called straight from the gate and fingerprint
+        threads; runs the work on its own thread so no caller is ever blocked."""
         if not self.asleep:
             return
+        t = threading.Thread(target=self._wake_worker, args=(why,), name="wake", daemon=True)
+        t.start()
+        if wait:
+            t.join(20)
+
+    def _wake_worker(self, why):
+        with self._wake_lock:
+            if self._wake_done or not self.asleep:
+                return
+            self._wake_done = True
         log.info("=== wake (%s) ===", why)
         self.last_wake_why = why
+        self.asleep = False                      # new sleep requests are allowed from here on
         self.gate.stop()
         if self.fp.active or self.fp._sess is not None:
-            threading.Thread(target=self.fp.stop, name="fp-stop", daemon=True).start()   # WinBio calls never on the UI thread
+            threading.Thread(target=self.fp.stop, name="fp-stop", daemon=True).start()
         locked_now = bool(session_locked())
-        # a matched fingerprint on an unlocked desktop is already an authentication
-        skip_lock = why == "fingerprint" and self.cfg.get("fingerprint_unlocks", False)
-        if self.cfg["lock_on_wake"] and not skip_lock and not locked_now and not self.selftest:
+        # the user just authenticated (sign-in, or a matched finger on an open desktop)
+        authenticated = why == "session unlocked" or (why == "fingerprint" and self.cfg.get("fingerprint_unlocks", False))
+        if self.cfg["lock_on_wake"] and not authenticated and not locked_now and not self.selftest:
             if not user32.LockWorkStation():
                 log.warning("LockWorkStation failed: %s", ctypes.get_last_error())
+        for h in self.hidden_taskbars or taskbar_windows():
+            user32.ShowWindow(h, 5)
+        self.hidden_taskbars = []
         mons, saved = self.monitors, dict(self.saved)
-        threading.Thread(target=self._lights_on, args=(mons, saved), name="restore", daemon=True).start()
         self.monitors = []
+        threading.Thread(target=self._lights_on, args=(mons, saved), name="restore", daemon=True).start()
         try:
             os.remove(SENTINEL_PATH)
         except OSError:
             pass
         self.engine.helper.call("/awake", {})
+        self.engine.set_context(asleep=False)
+        if self.icon:
+            self.icon.icon = make_icon_image()
+            self.icon.title = "Lights Out"
+        try:
+            self.root.after(0, self._after_wake_ui)      # overlays, execution state: UI thread, best-effort
+        except Exception:
+            pass
         if locked_now and why != "session unlocked":
             # woke onto the lock screen (a key, a click): if nobody signs in, go dark again
             mins = float(self.cfg.get("relock_minutes", 3) or 0)
             if mins > 0:
-                self.root.after(int(mins * 60_000), self._resleep_if_still_locked)
+                threading.Timer(mins * 60, self._resleep_if_still_locked).start()
+        log.info("awake")
+
+    def _after_wake_ui(self):
         for o in self.overlays:
             try:
                 o.destroy()
             except Exception:
                 pass
         self.overlays = []
-        for h in self.hidden_taskbars:
-            user32.ShowWindow(h, 5)
-        self.hidden_taskbars = []
         kernel32.SetThreadExecutionState(ES_CONTINUOUS)
-        self.asleep = False
-        self.engine.set_context(asleep=False)
-        if self.icon:
-            self.icon.icon = make_icon_image()
-            self.icon.title = "Lights Out"
-        log.info("awake")
 
     def _lights_on(self, mons, saved):
         for m in mons:
@@ -1287,7 +1359,7 @@ class App:
     def _resleep_if_still_locked(self):
         if not self.asleep and session_locked():
             log.info("still on the lock screen after the wake: going dark again")
-            self.sleep()
+            self.sleep()                         # posts itself to the UI thread
 
     def _restore(self, mons, saved):
         deadline = time.monotonic() + 15
@@ -1313,7 +1385,7 @@ class App:
 
     def quit(self):
         if self.asleep:
-            self.wake("quit")
+            self.wake("quit", wait=True)
         self.engine.stop()
         self.engine.join(8)
         try:
@@ -1451,14 +1523,19 @@ def main():
         log.info("install: %s", lines)
         user32.MessageBoxW(None, "\n".join(lines), "Lights Out", 0x40)
         return
-    mutex = kernel32.CreateMutexW(None, False, "Local\\LightsOutTray")
-    if kernel32.GetLastError() == 183:
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)      # the error code must be read the safe way
+    mutex = k32.CreateMutexW(None, False, "Local\\LightsOutTray")
+    if ctypes.get_last_error() == 183:                          # ERROR_ALREADY_EXISTS: another instance is up
         open(SIGNAL_PATH, "w").close()
+        log.info("another instance is running: asked it to open the panel")
         return
     log.info("starting (pid %s, frozen=%s, data=%s)", os.getpid(), FROZEN, DATA_DIR)
+    _trace("logging up, mutex taken")
     try:
         app = App(selftest="--selftest" in sys.argv)
+        _trace("app ready")
         selftest(app) if app.selftest else app.run()
+        _trace("mainloop ended")
     except SystemExit:
         raise
     except Exception:

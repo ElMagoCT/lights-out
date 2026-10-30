@@ -160,6 +160,35 @@ What changed:
 - The helper token is re-read after a 403, so a restarted helper is picked up
   without restarting the tray app (found by the self-test).
 
+## Second hang, 2026-10-29, and the missing icon on the 30th
+
+Slept (locked) at 23:15 on the 27th; closed by the user as "not responding"
+at 20:06 on the 29th. The helper's watchdog did not fire: the heartbeat file
+was still being touched, so the UI thread was pumping even though its windows
+no longer answered, and the Python-level hang detector wrote nothing. Then
+Windows Update rebooted the machine at 01:05 on the 30th and the Startup
+folder shortcut did not bring the app back, so there was no tray icon.
+
+What changed:
+- **The wake path no longer needs the UI thread.** `wake()` is thread-safe
+  and runs on its own worker: lock, taskbar, monitors, brightness, helper,
+  all from there; Tk is only asked, without waiting, to drop its overlay
+  windows. The gate and the fingerprint thread call it directly.
+- **No overlay windows in the locked mode.** The lock screen covers
+  everything; fewer windows means nothing left to become "not responding".
+  The heartbeat is now written by a worker thread *only while the UI thread
+  is also pumping*, so a stuck UI is seen by the helper's watchdog.
+- **A wake caused by signing in no longer re-locks the session.** It did
+  (lock-on-wake fired right after the unlock event).
+- **`faulthandler.dump_traceback_later`** re-armed from the UI pump: if the
+  UI thread stops for 40 s, a C-level watchdog dumps every thread's stack to
+  `crash.log` without needing the GIL.
+- **Autostart through the HKCU Run key** instead of the Startup folder, and
+  the tray icon is only added once `Shell_TrayWnd` exists. `startup.log`
+  gets a breadcrumb at launch, after logging is up, when the app is ready
+  and when the icon is added, so a vanished start is diagnosable.
+- Single-instance check reads the error code through `use_last_error`.
+
 ## Open items
 
 - Confirm the fingerprint wake with a real touch on another unit.
