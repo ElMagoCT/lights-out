@@ -25,9 +25,14 @@ computed locally from your location (detected once, or typed in), the level
 you set by day is scaled down at night by the strength you chose, with a
 smooth transition around dawn and dusk.
 
-**Sleep.** Windows locks, every monitor goes black, brightness to 0, then
-DDC/CI standby; the taskbar hides; the PC is held awake so Windows' own sleep
-never kicks in. **Wake** = signing in (Windows Hello fingerprint or password)
+**Sleep.** Every monitor goes dark first and Windows locks after, so the
+lock screen is never drawn on a lit panel: brightness to 0, then DDC/CI
+standby where the monitor implements it. A monitor with no standby command
+(it acknowledges the write and ignores it) is disconnected instead, the way
+Settings > "Disconnect this display" does, which is the only thing that turns
+such a backlight off; on wake it is reconnected with its position, HDR and
+brightness exactly as before. The taskbar hides; the PC is held awake so
+Windows' own sleep never kicks in. **Wake** = signing in (Windows Hello fingerprint or password)
 brings the screens back, and so do two presses within five seconds, where a
 press is any key or any mouse button (movement never counts). If the screens
 come on and nobody signs in, they go dark again after three minutes. Locking
@@ -150,6 +155,10 @@ Stop the tray instance first; the self-test only opens its panel otherwise.
   talks to the monitors' own controllers and holds `ES_SYSTEM_REQUIRED`.
 - dxva2 physical-monitor handle **0 is a valid handle**. Never test it for truth.
 - An HDR monitor can accept the DDC brightness command and change nothing.
+- A monitor can accept the DDC/CI standby command and ignore it too. The
+  capabilities string says whether `D6` is really there (the GM34-CWQ2's is
+  not); without it only cutting the video signal turns the backlight off, and
+  `SetDisplayConfig` can do that for one monitor and put it back unchanged.
 - Low-level keyboard hooks do not see the lock screen, so lock on wake.
 - psutil's per-process CPU reading costs ~850 ms for 300 processes on
   Windows; one `NtQuerySystemInformation` call costs 5 ms.

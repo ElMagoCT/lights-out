@@ -200,12 +200,17 @@ class Watchdog:
         show_taskbars()
         try:
             import monitors as mon
+            import topology
+            topo = topology.Snapshot.from_json(st.get("topology"))
+            if topo is not None:
+                # a monitor without DDC/CI standby was disconnected to turn it off
+                log.info("displays reconnected: %s", topology.restore(topo))
             saved = st.get("saved", {})
             for m in mon.enumerate_monitors(probe_wmi=False):
                 m.power(True)
             time.sleep(1.5)
             for m in mon.enumerate_monitors(probe_wmi=False):
-                entry = saved.get(m.device, {})
+                entry = saved.get(m.device) or next((v for v in saved.values() if v.get("name") == m.name), {})
                 if entry.get("sdr_nits"):
                     m.set_sdr_white_nits(entry["sdr_nits"])
                 if entry.get("backlight") is not None and (m.ddc or m.wmi):

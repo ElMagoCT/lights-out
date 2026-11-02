@@ -67,7 +67,7 @@ except Exception:
 DEFAULTS = {
     "presses": 2, "window_seconds": 5, "lock_on_sleep": True, "lock_on_wake": True, "relock_minutes": 3,
     "wake_on_click": True, "fingerprint_wake": True, "fingerprint_unlocks": False,
-    "dim_on_sleep": True, "ddc_standby": True, "hide_taskbar_asleep": True,
+    "dim_on_sleep": True, "ddc_standby": True, "hide_taskbar_asleep": True, "detach_no_standby": True,
     "hotkeys": {"sleep": "ctrl+alt+s", "panel": "ctrl+alt+b",
                 "brightness_up": "ctrl+alt+up", "brightness_down": "ctrl+alt+down"},
     "brightness_step": 10,
@@ -138,6 +138,7 @@ import monitors as mon         # noqa: E402
 import sun                     # noqa: E402
 import security                # noqa: E402
 import fingerprint             # noqa: E402
+import topology                # noqa: E402
 from gate import WakeGate, session_locked  # noqa: E402
 
 user32 = ctypes.windll.user32
@@ -310,6 +311,11 @@ class App:
         self.panel = self.settings_win = self.report_win = None
         self.asleep = False
         self.saved = {}
+        self.topo = None            # display layout at sleep, put back on wake
+        self.detached = set()       # (adapter lo, hi, target) disconnected to turn a monitor off
+        self.dark_plan = {}
+        self._dark = False
+        self._restore_thread = None
         self.hidden_taskbars = []
         self.writer = LatestWriter()
         self.gate = WakeGate(int(self.cfg["presses"]), float(self.cfg["window_seconds"]), clicks=bool(self.cfg.get("wake_on_click", True)))
@@ -448,6 +454,9 @@ class App:
                 st = json.load(f)
             os.remove(SENTINEL_PATH)
             log.warning("previous instance died while asleep (since %s): restoring monitors", st.get("since"))
+            topo = topology.Snapshot.from_json(st.get("topology"))
+            if topo is not None:
+                log.warning("displays reconnected: %s", topology.restore(topo))
             mons = mon.enumerate_monitors(probe_wmi=False)
             for m in mons:
                 m.power(True)
@@ -971,7 +980,7 @@ class App:
         v["lock_on_wake"] = tk.BooleanVar(value=cfg["lock_on_wake"]); v["hide_taskbar_asleep"] = tk.BooleanVar(value=cfg.get("hide_taskbar_asleep", True))
         v["lock_on_sleep"] = tk.BooleanVar(value=cfg.get("lock_on_sleep", True))
         v["relock_minutes"] = tk.IntVar(value=int(cfg.get("relock_minutes", 3)))
-        ttk.Checkbutton(f, text="Lock Windows the moment it sleeps (password or Windows Hello to get back in, "
+        ttk.Checkbutton(f, text="Lock Windows at sleep, once the screens are dark (password or Windows Hello to get back in, "
                                 "even if this app dies)", variable=v["lock_on_sleep"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
         r = row(f, r, "If woken onto the lock screen and nobody signs in, go dark again after (minutes, 0 = never)",
                 ttk.Spinbox(f, from_=0, to=60, width=5, textvariable=v["relock_minutes"]))
@@ -986,6 +995,9 @@ class App:
         ttk.Checkbutton(f, text="...and a matched fingerprint on an unlocked desktop skips the lock screen",
                         variable=v["fingerprint_unlocks"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
         ttk.Checkbutton(f, text="Hide the taskbar while asleep", variable=v["hide_taskbar_asleep"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        v["detach_no_standby"] = tk.BooleanVar(value=cfg.get("detach_no_standby", True))
+        ttk.Checkbutton(f, text="A monitor with no DDC/CI standby command is disconnected while asleep (signal off, so its "
+                                "backlight turns off; reconnected on wake)", variable=v["detach_no_standby"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
         ttk.Label(f, text="Hotkeys  (e.g. ctrl+alt+s, ctrl+shift+f9, win+pause)", style="Section.TLabel").grid(row=r, column=0, columnspan=2, sticky="w", pady=(14, 2)); r += 1
         v["hotkeys"] = {}
         for key, label in (("sleep", "Sleep now"), ("panel", "Open panel"), ("brightness_up", "Brightness up"), ("brightness_down", "Brightness down")):
@@ -1132,6 +1144,7 @@ class App:
             cfg["wake_on_click"] = bool(v["wake_on_click"].get()); cfg["fingerprint_wake"] = bool(v["fingerprint_wake"].get())
             cfg["fingerprint_unlocks"] = bool(v["fingerprint_unlocks"].get())
             cfg["lock_on_sleep"] = bool(v["lock_on_sleep"].get()); cfg["relock_minutes"] = max(0, int(v["relock_minutes"].get()))
+            cfg["detach_no_standby"] = bool(v["detach_no_standby"].get())
             cfg["brightness_step"] = max(1, int(v["brightness_step"].get()))
             cfg["hotkeys"] = {k: var.get().strip() for k, var in v["hotkeys"].items()}
             pw = cfg["power"]
@@ -1182,6 +1195,8 @@ class App:
         self.hide_panel()
         self.asleep = True
         self._wake_done = False
+        self._dark = False
+        self.dark_plan = {}
         log.info("=== sleep ===")
         self.engine.set_context(asleep=True)
         if self.icon:
@@ -1189,12 +1204,10 @@ class App:
             self.icon.title = "Lights Out - asleep (press any key twice to wake)"
         self.refresh_monitors()
         kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+        # Locking happens on the lights-off worker once every screen is dark, so the
+        # lock screen is never drawn on a lit monitor; the helper's watchdog locks
+        # for us if this process dies in between.
         lock_now = self.cfg.get("lock_on_sleep", True) and not self.selftest
-        if lock_now:
-            # Lock first: a password (or Windows Hello) is required to get back in no
-            # matter what happens to this process afterwards.
-            if not user32.LockWorkStation():
-                log.warning("LockWorkStation failed: %s", ctypes.get_last_error())
         if self.cfg.get("hide_taskbar_asleep", True):
             self.hidden_taskbars = taskbar_windows()
             for h in self.hidden_taskbars:
@@ -1220,20 +1233,29 @@ class App:
                 log.warning("fingerprint wake not armed (sensor busy?)")
         self.saved = {}
         for m in self.monitors:
-            entry = {}
+            entry = {"name": m.name}
             if m.brightness is not None:
                 entry["backlight"] = m.brightness
             if m.hdr:
                 entry["sdr_nits"] = m.sdr_white_nits()
             self.saved[m.device] = entry
+        self.topo = topology.snapshot()          # the layout to put back if a monitor gets disconnected
+        self.detached = set()
         self._touch_heartbeat()
         self._write_sentinel()
-        self.engine.helper.call("/asleep", {"pid": os.getpid(), "heartbeat": HEARTBEAT_PATH, "saved": self.saved})
-        threading.Thread(target=self._lights_off, args=(list(self.monitors),), name="lights-off", daemon=True).start()
+        self.engine.helper.call("/asleep", {"pid": os.getpid(), "heartbeat": HEARTBEAT_PATH, "saved": self.saved,
+                                            "topology": self.topo.to_json() if self.topo else None})
+        threading.Thread(target=self._lights_off, args=(list(self.monitors), lock_now), name="lights-off", daemon=True).start()
         threading.Thread(target=self._asleep_loop, name="asleep-loop", daemon=True).start()
-        log.info("asleep (locked=%s); saved %s", lock_now, self.saved)
+        log.info("asleep (locking=%s); saved %s", lock_now, self.saved)
 
-    def _lights_off(self, mons):
+    def _lights_off(self, mons, lock_now):
+        """Worker: dim, take every monitor dark, then lock. DDC/CI standby where
+        the monitor implements it; otherwise its video signal is cut (the way
+        Settings > Disconnect this display does), which is the only thing that
+        turns such a backlight off. The lock comes last so the lock screen is
+        never drawn on a lit screen."""
+        plan = {"standby": [], "disconnected": [], "dimmed": []}
         try:
             for m in mons:
                 if self.cfg["dim_on_sleep"]:
@@ -1241,12 +1263,39 @@ class App:
                         m.set(m.min)
                     if m.hdr:
                         m.set_sdr_white_nits(mon.SDR_MIN_NITS)
-            if self.cfg["ddc_standby"]:
-                time.sleep(0.2)
-                for m in mons:
+            time.sleep(0.2)
+            if self._wake_done:                  # woken already (an early key): leave the screens alone
+                return
+            to_detach = {}
+            for m in mons:
+                if self.cfg["ddc_standby"] and m.standby_capable():
                     m.power(False)
+                    plan["standby"].append(m.name)
+                elif self.cfg.get("detach_no_standby", True) and self.topo is not None and m.adapter is not None:
+                    to_detach[(m.adapter[0], m.adapter[1], m.target)] = m.name
+                else:
+                    plan["dimmed"].append(m.name)
+            if to_detach:
+                rc = topology.detach(self.topo, set(to_detach))
+                if rc == 0:
+                    self.detached = set(to_detach)
+                    plan["disconnected"] = list(to_detach.values())
+                    log.info("disconnected to turn off (no DDC/CI standby): %s", plan["disconnected"])
+                else:
+                    plan["dimmed"] += list(to_detach.values())
+                    log.warning("could not disconnect %s (rc %s): left dimmed", list(to_detach.values()), rc)
         except Exception:
             log.exception("lights off")
+        finally:
+            self.dark_plan = plan
+            self._dark = True
+            if lock_now:
+                time.sleep(1.2)                  # let the panels blank before the lock screen exists
+                if self.asleep and not self._wake_done:
+                    if not user32.LockWorkStation():
+                        log.warning("LockWorkStation failed: %s", ctypes.get_last_error())
+                    else:
+                        log.info("Windows locked (screens dark: %s)", plan)
 
     def _touch_heartbeat(self):
         try:
@@ -1260,7 +1309,7 @@ class App:
         try:
             with open(SENTINEL_PATH, "w", encoding="utf-8") as f:
                 json.dump({"since": dt.datetime.now().isoformat(timespec="seconds"), "pid": os.getpid(),
-                           "saved": self.saved}, f)
+                           "saved": self.saved, "topology": self.topo.to_json() if self.topo else None}, f)
         except OSError:
             log.exception("sentinel")
 
@@ -1316,9 +1365,10 @@ class App:
         for h in self.hidden_taskbars or taskbar_windows():
             user32.ShowWindow(h, 5)
         self.hidden_taskbars = []
-        mons, saved = self.monitors, dict(self.saved)
+        mons, saved, topo = self.monitors, dict(self.saved), self.topo
         self.monitors = []
-        threading.Thread(target=self._lights_on, args=(mons, saved), name="restore", daemon=True).start()
+        self._restore_thread = threading.Thread(target=self._lights_on, args=(mons, saved, topo), name="restore", daemon=True)
+        self._restore_thread.start()
         try:
             os.remove(SENTINEL_PATH)
         except OSError:
@@ -1348,7 +1398,17 @@ class App:
         self.overlays = []
         kernel32.SetThreadExecutionState(ES_CONTINUOUS)
 
-    def _lights_on(self, mons, saved):
+    def _lights_on(self, mons, saved, topo):
+        deadline = time.monotonic() + 20
+        while not self._dark and time.monotonic() < deadline:
+            time.sleep(0.1)                      # the lights-off worker may still be at it (an early wake)
+        if topo is not None and self.detached:
+            ok = topology.restore(topo)
+            log.info("reconnected %s -> %s", sorted(self.detached), ok)
+            self.detached = set()
+            for m in mons:
+                m.close()
+            mons = mon.enumerate_monitors(probe_wmi=False)   # fresh handles after the layout change
         for m in mons:
             try:
                 m.power(True)
@@ -1362,18 +1422,21 @@ class App:
             self.sleep()                         # posts itself to the UI thread
 
     def _restore(self, mons, saved):
+        def entry(m):
+            e = saved.get(m.device)
+            if e is None:       # a reconnected monitor can come back under another device name
+                e = next((v for v in saved.values() if v.get("name") == m.name), None)
+            return e or {}
         deadline = time.monotonic() + 15
-        todo = {m.device: m for m in mons if saved.get(m.device)}
+        todo = {m.device: m for m in mons if entry(m).get("backlight") is not None and (m.ddc or m.wmi)}
         for m in mons:
-            nits = saved.get(m.device, {}).get("sdr_nits")
+            nits = entry(m).get("sdr_nits")
             if nits:
                 m.set_sdr_white_nits(nits)
         while todo and time.monotonic() < deadline:
             for dev, m in list(todo.items()):
-                want = saved[dev].get("backlight")
-                if want is None or not (m.ddc or m.wmi):
-                    del todo[dev]
-                elif m.set(want) and (m.wmi or m.read() == want):
+                want = entry(m)["backlight"]
+                if m.set(want) and (m.wmi or m.read() == want):
                     del todo[dev]
             if todo:
                 time.sleep(0.5)
@@ -1386,6 +1449,8 @@ class App:
     def quit(self):
         if self.asleep:
             self.wake("quit", wait=True)
+        if self._restore_thread is not None:
+            self._restore_thread.join(15)        # a disconnected monitor must be back before we exit
         self.engine.stop()
         self.engine.join(8)
         try:
@@ -1438,6 +1503,7 @@ def inject_click():
 
 def selftest(app):
     before = {m.device: (m.brightness, m.sdr_white_nits() if m.hdr else None) for m in mon.enumerate_monitors(probe_wmi=False)}
+    displays_before = len(topology.active_targets())
     result = {"ok": False}
 
     def step0():
@@ -1455,12 +1521,20 @@ def selftest(app):
         app.hide_panel()
         app.root.after(300, step1)
 
+    def wait_dark(nxt, secs=15.0):                         # the lights-off worker probes and disconnects: give it time
+        if app._dark or secs <= 0:
+            app.root.after(400, nxt)
+        else:
+            app.root.after(250, lambda: wait_dark(nxt, secs - 0.25))
+
     def step1():                                           # sleep #1: two mouse clicks must wake it
         app.sleep()
-        app.root.after(1500, step2)
+        wait_dark(step2)
 
     def step2():
         result["asleep"] = app.asleep
+        result["dark_plan"] = app.dark_plan
+        result["displays_while_asleep"] = len(topology.active_targets())
         result["fingerprint_armed"] = app.fp.active if app.fp.available() else "n/a"
         result["taskbar_hidden"] = all(not user32.IsWindowVisible(h) for h in app.hidden_taskbars) and bool(app.hidden_taskbars)
         result["sentinel_written"] = os.path.exists(SENTINEL_PATH)
@@ -1483,7 +1557,7 @@ def selftest(app):
 
     def step5():                                           # sleep #2: two key taps must wake it
         app.sleep()
-        app.root.after(1500, step6)
+        wait_dark(step6)
 
     def step6():
         inject_key_tap()
@@ -1503,8 +1577,10 @@ def selftest(app):
             time.sleep(0.5)
         result["restored"] = after == before
         result["before"], result["after"] = before, after
-        checks = ("awake_after_two_clicks", "awake_after_two_taps", "restored", "panel_via_hotkey", "taskbar_hidden", "taskbar_back",
-                  "sentinel_written", "sentinel_cleared", "heartbeat_fresh", "watchdog_armed")
+        result["displays_awake"] = len(topology.active_targets())
+        result["reconnected"] = result["displays_awake"] == displays_before
+        checks = ("awake_after_two_clicks", "awake_after_two_taps", "restored", "reconnected", "panel_via_hotkey", "taskbar_hidden",
+                  "taskbar_back", "sentinel_written", "sentinel_cleared", "heartbeat_fresh", "watchdog_armed")
         result["ok"] = all(result.get(k) for k in checks) and result.get("fingerprint_armed") in (True, "n/a") \
             and result.get("fingerprint_disarmed") in (True, "n/a")
         print(json.dumps(result, indent=2))

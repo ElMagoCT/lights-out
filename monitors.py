@@ -88,6 +88,36 @@ class SDR_WHITE_SET(ctypes.Structure):
 
 SDR_MIN_NITS, SDR_MAX_NITS = 80, 480
 VCP_CONTRAST = 0x12
+_STANDBY_CACHE = {}         # monitor name -> implements VCP 0xD6 (probed once per session)
+
+
+def _caps_vcp_codes(caps):
+    """Top-level VCP codes listed in a capabilities string, lower-case, e.g. {'10', 'd6'}."""
+    s = caps.lower()
+    i = s.find("vcp(")
+    if i < 0:
+        return set()
+    depth, out, tok = 0, set(), ""
+    for ch in s[i + 4:]:
+        if ch == "(":
+            if depth == 0 and tok:
+                out.add(tok)
+                tok = ""
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0:
+            if ch.isspace():
+                if tok:
+                    out.add(tok)
+                    tok = ""
+            else:
+                tok += ch
+    if tok:
+        out.add(tok)
+    return out
 
 
 def _display_config():
@@ -137,6 +167,7 @@ class Monitor:
         self.hdr_supported = False
         self.adapter = None         # DisplayConfig (LUID lo, hi) and target id, for HDR / SDR white
         self.target = None
+        self._standby = None        # implements VCP 0xD6 (power mode)? None = not probed yet
 
     # -- HDR / SDR white level (DisplayConfig) ----------------------------------
     def _hdr_header(self, cls, type_):
@@ -224,6 +255,46 @@ class Monitor:
         return ok
 
     # -- power --------------------------------------------------------------
+    def capabilities(self):
+        """The MCCS capabilities string, or None if the monitor does not answer."""
+        if self.handle is None:
+            return None
+        n = wt.DWORD()
+        for attempt in range(3):
+            if dxva2.GetCapabilitiesStringLength(self.handle, ctypes.byref(n)) and n.value:
+                buf = ctypes.create_string_buffer(n.value)
+                if dxva2.CapabilitiesRequestAndCapabilitiesReply(self.handle, buf, n):
+                    return buf.value.decode(errors="replace")
+            time.sleep(0.2)
+        return None
+
+    def standby_capable(self):
+        """True if the monitor implements VCP 0xD6 (power mode). A monitor without
+        it (the GM34-CWQ2 here) acknowledges the standby write and ignores it, so
+        the only way to get its backlight off is to cut its video signal. Decided
+        from the capabilities string, else from a read of 0xD6; once per name."""
+        if self._standby is None:
+            if self.name in _STANDBY_CACHE:
+                self._standby = _STANDBY_CACHE[self.name]
+                return self._standby
+            self._standby = False
+            if self.handle is not None:
+                caps = self.capabilities()
+                codes = _caps_vcp_codes(caps) if caps else set()
+                if codes:
+                    self._standby = "d6" in codes
+                else:
+                    t, cur, mx = ctypes.c_uint(), wt.DWORD(), wt.DWORD()
+                    for attempt in range(3):
+                        if dxva2.GetVCPFeatureAndVCPFeatureReply(self.handle, VCP_POWER, ctypes.byref(t),
+                                                                 ctypes.byref(cur), ctypes.byref(mx)):
+                            self._standby = True
+                            break
+                        time.sleep(0.2)
+            _STANDBY_CACHE[self.name] = self._standby
+            log.info("%s: DDC/CI standby %s", self.name, "supported" if self._standby else "NOT supported")
+        return self._standby
+
     def power(self, on):
         if self.handle is None:
             return False

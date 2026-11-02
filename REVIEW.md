@@ -189,6 +189,37 @@ What changed:
   and when the icon is added, so a vanished start is diagnosable.
 - Single-instance check reads the error code through `use_last_error`.
 
+## Lock screen instead of black, 2026-11-01
+
+Reported: sleep showed the lock screen, and one monitor went fully off while
+the other stayed black but lit. The capabilities strings explain it: the
+ES-24X5AL lists `D6(01 04 05)` and honours standby; the GM34-CWQ2 has no
+`D6` at all, acknowledges the standby write and ignores it, so it kept
+showing whatever Windows drew, which, with the lock coming first, was the
+lock screen. The System event log shows no Modern Standby entry since 10-24,
+so Windows never turned the display off during any sleep: the app's
+display-required hold works on the lock screen too, and the only way to get
+that backlight off is to stop the signal.
+
+What changed:
+- **Standby capability is probed** once per monitor (capabilities string,
+  else a read of 0xD6) and cached by name.
+- **A monitor without it is disconnected** with `SetDisplayConfig`
+  (`topology.py`), the equivalent of Settings > "Disconnect this display";
+  the signal stops and the monitor's own standby turns the backlight off.
+  The saved configuration is applied again on wake, by the helper's watchdog
+  if the app dies, and by the next start from the sentinel file. Measured:
+  disconnect 0.37 s, reconnect 0.14 s plus monitor sync; HDR, SDR white
+  level, primary display and the positions of all 12 open windows unchanged
+  after the round trip. The watchdog path was exercised with the monitor
+  disconnected and the other in standby: everything back in 2.8 s.
+- **Lock after dark.** The lights-off worker locks Windows 1.2 s after the
+  screens are dark instead of the UI thread locking first. An early wake
+  cancels the pending lock, and the restore waits for the worker so a
+  disconnect can never land after the reconnect.
+- The self-test waits for the dark plan, reports it, and checks the display
+  count while asleep (1 here) and after wake (2).
+
 ## Open items
 
 - Confirm the fingerprint wake with a real touch on another unit.
