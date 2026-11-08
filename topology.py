@@ -145,6 +145,35 @@ def restore(snap, wait=6.0):
     return want <= active_targets()
 
 
+def wake_standby(snap, standby_targets, settle=1.0):
+    """Wake monitors that were put into DDC/CI standby but do not come back from a
+    power-on (D6=1) write (the ES-24X5AL here acknowledges D6=1 and stays asleep
+    until power-cycled). Momentarily drop each from the desktop and re-apply the
+    full configuration: losing and regaining the video signal makes the monitor
+    power its backlight on, the same as unplugging and replugging it. At least one
+    display stays active throughout. Also brings back anything that was detached.
+    Returns True once the whole saved configuration is active again."""
+    want = {(lo, hi, tid) for lo, hi, tid, active in snap.targets() if active}
+    standby = {tuple(t) for t in standby_targets} & want
+    if not standby:
+        return restore(snap)
+    others = want - standby
+    if others:
+        # drop every standby target at once; the others keep a display active
+        detach(snap, standby)
+        time.sleep(settle)
+        return restore(snap)
+    # nothing else to hold the desktop up: cycle the standby targets one at a time
+    ok = True
+    for t in standby:
+        if len(want) <= 1:
+            break                                # cannot drop the only display
+        detach(snap, {t})
+        time.sleep(settle)
+        ok = restore(snap) and ok
+    return ok
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     s = snapshot()

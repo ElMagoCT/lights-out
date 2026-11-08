@@ -220,6 +220,51 @@ What changed:
 - The self-test waits for the dark plan, reports it, and checks the display
   count while asleep (1 here) and after wake (2).
 
+## Standby monitor would not wake, 2026-11-08
+
+Reported: the second monitor (ES-24X5AL) had to be switched off and on by hand
+to come back; the main monitor (GM34-CWQ2) turned fully off, which was fine.
+The log told the story: over a week of real sleeps the disconnected GM34 woke
+every time, while the ES-24X5AL logged `power ES-24X5AL on -> True` on every
+wake and still stayed dark. The monitor acknowledges the DDC/CI power-on write
+(VCP D6 = 1) and ignores it; its backlight only comes back when the video
+signal re-asserts.
+
+What changed:
+- **Standby monitors are now woken by a signal cycle, not a D6 write.** The
+  targets put into DDC/CI standby at sleep are recorded; on wake each is
+  momentarily dropped from the desktop and the full configuration re-applied,
+  so the monitor sees signal loss then signal return and powers its backlight
+  on, the same as the disconnect path that already worked. At least one display
+  stays active throughout (`topology.wake_standby`). Verified: ES detached in
+  0.06 s and re-attached, both displays active at the end, HDR and all nine
+  open windows' positions unchanged; the full self-test green with the standby
+  monitor cycled on both the click and the key wake.
+- **The helper watchdog and the startup recovery do the same.** The sleep
+  sentinel and the `/asleep` payload now carry the standby target list, so a
+  death or hang while asleep still brings the standby monitor back, not just
+  the disconnected ones.
+- Confirmed the laptop's internal panel (lid open) is handled: it has no
+  working DDC, so it is disconnected with the GM34 and restored on wake; the
+  three-display round trip kept the layout exact.
+
+Note on the main monitor staying "fully black" rather than fully off: the
+GM34-CWQ2 has no DDC/CI power control at all, so the only way to turn its
+backlight off is to drop its signal (fully off). Keeping it on showing black
+would leave the backlight lit (a VA panel still glows) and, because Windows is
+locked at sleep, would show the lock screen on it. Showing black instead of
+disconnecting is therefore only possible with locking turned off (the unlocked
+black-overlay mode), which was the behaviour deliberately dropped after the
+2026-10-25 incident. Left disconnected by default.
+
+## Caveat: adapter LUIDs are not stable across reboots
+
+While testing, the GPU adapter LUIDs changed between sessions (GM34 `86924` →
+`87795`, ES `597543` → `1569187`). The app is unaffected because it snapshots
+the live display configuration at each sleep and writes it to the sentinel
+fresh, but any stored display identifier must be treated as per-session, not
+persistent.
+
 ## Open items
 
 - Confirm the fingerprint wake with a real touch on another unit.

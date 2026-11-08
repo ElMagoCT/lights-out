@@ -313,6 +313,7 @@ class App:
         self.saved = {}
         self.topo = None            # display layout at sleep, put back on wake
         self.detached = set()       # (adapter lo, hi, target) disconnected to turn a monitor off
+        self.standby_targets = set()  # (adapter lo, hi, target) put into DDC/CI standby (cycled on wake)
         self.dark_plan = {}
         self._dark = False
         self._restore_thread = None
@@ -456,7 +457,9 @@ class App:
             log.warning("previous instance died while asleep (since %s): restoring monitors", st.get("since"))
             topo = topology.Snapshot.from_json(st.get("topology"))
             if topo is not None:
-                log.warning("displays reconnected: %s", topology.restore(topo))
+                standby = st.get("standby") or []
+                ok = topology.wake_standby(topo, standby) if standby else topology.restore(topo)
+                log.warning("displays restored (standby %s): %s", standby, ok)
             mons = mon.enumerate_monitors(probe_wmi=False)
             for m in mons:
                 m.power(True)
@@ -1241,10 +1244,10 @@ class App:
             self.saved[m.device] = entry
         self.topo = topology.snapshot()          # the layout to put back if a monitor gets disconnected
         self.detached = set()
+        self.standby_targets = set()
         self._touch_heartbeat()
         self._write_sentinel()
-        self.engine.helper.call("/asleep", {"pid": os.getpid(), "heartbeat": HEARTBEAT_PATH, "saved": self.saved,
-                                            "topology": self.topo.to_json() if self.topo else None})
+        self._notify_helper_asleep()
         threading.Thread(target=self._lights_off, args=(list(self.monitors), lock_now), name="lights-off", daemon=True).start()
         threading.Thread(target=self._asleep_loop, name="asleep-loop", daemon=True).start()
         log.info("asleep (locking=%s); saved %s", lock_now, self.saved)
@@ -1267,14 +1270,18 @@ class App:
             if self._wake_done:                  # woken already (an early key): leave the screens alone
                 return
             to_detach = {}
+            standby = set()
             for m in mons:
                 if self.cfg["ddc_standby"] and m.standby_capable():
                     m.power(False)
                     plan["standby"].append(m.name)
+                    if m.adapter is not None:
+                        standby.add((m.adapter[0], m.adapter[1], m.target))
                 elif self.cfg.get("detach_no_standby", True) and self.topo is not None and m.adapter is not None:
                     to_detach[(m.adapter[0], m.adapter[1], m.target)] = m.name
                 else:
                     plan["dimmed"].append(m.name)
+            self.standby_targets = standby
             if to_detach:
                 rc = topology.detach(self.topo, set(to_detach))
                 if rc == 0:
@@ -1288,6 +1295,11 @@ class App:
             log.exception("lights off")
         finally:
             self.dark_plan = plan
+            # persist the final plan (standby + detached) so the helper watchdog and
+            # a fresh start can cycle the right monitors if this process dies asleep
+            if self.asleep and not self._wake_done:
+                self._write_sentinel()
+                self._notify_helper_asleep()
             self._dark = True
             if lock_now:
                 time.sleep(1.2)                  # let the panels blank before the lock screen exists
@@ -1305,13 +1317,23 @@ class App:
         except OSError:
             pass
 
+    def _sleep_state(self):
+        """What the helper watchdog and a fresh start need to put the desk back:
+        who is asleep, what to restore, the display layout, and which monitors
+        were parked in DDC/CI standby so they can be signal-cycled awake."""
+        return {"pid": os.getpid(), "heartbeat": HEARTBEAT_PATH, "saved": self.saved,
+                "topology": self.topo.to_json() if self.topo else None,
+                "standby": [list(t) for t in self.standby_targets]}
+
     def _write_sentinel(self):
         try:
             with open(SENTINEL_PATH, "w", encoding="utf-8") as f:
-                json.dump({"since": dt.datetime.now().isoformat(timespec="seconds"), "pid": os.getpid(),
-                           "saved": self.saved, "topology": self.topo.to_json() if self.topo else None}, f)
+                json.dump(dict(self._sleep_state(), since=dt.datetime.now().isoformat(timespec="seconds")), f)
         except OSError:
             log.exception("sentinel")
+
+    def _notify_helper_asleep(self):
+        self.engine.helper.call("/asleep", self._sleep_state())
 
     def _asleep_loop(self):
         """Worker thread while asleep: proves the process is alive to the helper's
@@ -1402,10 +1424,18 @@ class App:
         deadline = time.monotonic() + 20
         while not self._dark and time.monotonic() < deadline:
             time.sleep(0.1)                      # the lights-off worker may still be at it (an early wake)
-        if topo is not None and self.detached:
-            ok = topology.restore(topo)
-            log.info("reconnected %s -> %s", sorted(self.detached), ok)
+        standby = set(self.standby_targets)
+        if topo is not None and (self.detached or standby):
+            if standby:
+                # signal-cycle the standby monitors (they ignore D6=1) and, in the
+                # same pass, bring any disconnected monitor back
+                ok = topology.wake_standby(topo, standby)
+                log.info("woke standby %s + reconnected %s -> %s", sorted(standby), sorted(self.detached), ok)
+            else:
+                ok = topology.restore(topo)
+                log.info("reconnected %s -> %s", sorted(self.detached), ok)
             self.detached = set()
+            self.standby_targets = set()
             for m in mons:
                 m.close()
             mons = mon.enumerate_monitors(probe_wmi=False)   # fresh handles after the layout change

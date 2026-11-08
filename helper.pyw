@@ -203,8 +203,11 @@ class Watchdog:
             import topology
             topo = topology.Snapshot.from_json(st.get("topology"))
             if topo is not None:
-                # a monitor without DDC/CI standby was disconnected to turn it off
-                log.info("displays reconnected: %s", topology.restore(topo))
+                # bring back any disconnected monitor and signal-cycle any that were
+                # parked in DDC/CI standby (they ignore a plain power-on write)
+                standby = st.get("standby") or []
+                ok = topology.wake_standby(topo, standby) if standby else topology.restore(topo)
+                log.info("displays restored (standby %s): %s", standby, ok)
             saved = st.get("saved", {})
             for m in mon.enumerate_monitors(probe_wmi=False):
                 m.power(True)

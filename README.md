@@ -31,8 +31,12 @@ standby where the monitor implements it. A monitor with no standby command
 (it acknowledges the write and ignores it) is disconnected instead, the way
 Settings > "Disconnect this display" does, which is the only thing that turns
 such a backlight off; on wake it is reconnected with its position, HDR and
-brightness exactly as before. The taskbar hides; the PC is held awake so
-Windows' own sleep never kicks in. **Wake** = signing in (Windows Hello fingerprint or password)
+brightness exactly as before. A monitor that accepts DDC/CI standby but then
+ignores the power-on command (some do, so you would have to power-cycle it by
+hand) is woken the same reliable way: its video signal is briefly dropped and
+restored, which powers the backlight back on as if it were replugged, while
+another display keeps the desktop up. The taskbar hides; the PC is held awake
+so Windows' own sleep never kicks in. **Wake** = signing in (Windows Hello fingerprint or password)
 brings the screens back, and so do two presses within five seconds, where a
 press is any key or any mouse button (movement never counts). If the screens
 come on and nobody signs in, they go dark again after three minutes. Locking
