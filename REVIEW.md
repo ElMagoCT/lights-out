@@ -319,6 +319,22 @@ raised "str object is not callable"; renamed to `_devname`. Also noted for
 Voicemeeter users: auto-switch changes the Windows default device and can fight
 a Voicemeeter-as-default setup, so the tab says to turn it off in that case.
 
+## Faster panel, less chrome, 2026-11-08
+
+The panel took ~1.7 s to appear: `refresh_monitors` enumerated with six DDC
+retries, and the laptop's internal panel has a DDC handle that never answers, so
+it burned the full 6 x 0.25 s before falling back to the flaky path. Panel open
+(and the hotkey brightness nudge) now enumerate with one retry (~0.38 s);
+flaky monitors still become controllable, and the HDR monitor's level comes from
+DisplayConfig regardless. Sleep/wake keep the six retries for robustness.
+
+Trimmed the panel text the user called unnecessary: the per-monitor caption line
+("brightness" / "SDR content brightness (HDR on)"), the footer paragraph
+(sleep behaviour + hotkeys, all discoverable in Settings), the auto-switch
+status line, the "N apps slowed" counter, and the sun multiplier. Kept the live
+power/thermal line, sunrise/sunset, and a one-line security summary. The panel is
+about 140 px shorter.
+
 ## Open items
 
 - Confirm the fingerprint wake with a real touch on another unit.

@@ -599,7 +599,7 @@ class App:
                 val.set(int(val.get()) + step)
                 self._slide(m, val, lab, 1)
             return
-        self.refresh_monitors()
+        self.refresh_monitors(retries=1)
         for m in self.monitors:
             cur = level_get(m)
             cur = self.last.get(m.device, 50) if cur is None else cur
@@ -717,17 +717,17 @@ class App:
         self.report_win.lift()
 
     # -- brightness panel --------------------------------------------------------
-    def refresh_monitors(self):
+    def refresh_monitors(self, retries=6):
         for m in self.monitors:
             m.close()
-        self.monitors = mon.enumerate_monitors()
+        self.monitors = mon.enumerate_monitors(retries=retries)
 
     def show_panel(self):
         if self.asleep:
             return
         if self.panel and self.panel.winfo_exists():
             self.panel.destroy()
-        self.refresh_monitors()
+        self.refresh_monitors(retries=1)         # a dead DDC handle must not stall the pop-up; flaky monitors stay usable
         p = tk.Toplevel(self.root, bg=PANEL)
         p.overrideredirect(True)
         p.attributes("-topmost", True)
@@ -778,22 +778,21 @@ class App:
             level = level_get(m)
             if level is None and m.flaky:
                 level = self.last.get(m.device)
-                ttk.Label(head, text="not answering, slider still sent", style="Dim.TLabel").pack(side="left", padx=(8, 0))
+                ttk.Label(head, text="not answering", style="Dim.TLabel").pack(side="left", padx=(8, 0))
             elif level is not None:
                 self.last[m.device] = level
-            ttk.Label(f, text=level_kind(m), style="Dim.TLabel").grid(row=r + 1, column=0, columnspan=3, sticky="w")
             val = tk.IntVar(value=level if level is not None else 0)
             lab = ttk.Label(f, text=f"{val.get()}%", width=5, anchor="e")
-            lab.grid(row=r + 2, column=2, sticky="e")
+            lab.grid(row=r + 1, column=2, sticky="e")
             sc = ttk.Scale(f, from_=0, to=100, orient="horizontal", length=300, variable=val)
-            sc.grid(row=r + 2, column=0, columnspan=2, sticky="we", pady=(2, 0))
+            sc.grid(row=r + 1, column=0, columnspan=2, sticky="we", pady=(2, 0))
             for ev in ("<Button-1>", "<B1-Motion>"):
                 sc.bind(ev, lambda e, m=m, val=val, lab=lab, sc=sc: self._scale_jump(e, m, val, lab, sc))
             sc.bind("<MouseWheel>", lambda e, m=m, val=val, lab=lab: self._scale_wheel(e, m, val, lab))
             if not controllable(m):
                 sc.state(["disabled"])
             self.rows.append((m, val, lab, sc))
-            r += 3
+            r += 2
         # -- audio --
         if self.cfg["audio"].get("show_in_panel", True):
             r = self._build_audio_section(f, r)
@@ -815,22 +814,11 @@ class App:
         ttk.Button(f, text="Sleep now", style="Sleep.TButton", command=self.sleep).grid(
             row=r, column=0, columnspan=3, sticky="we", pady=(12, 4))
         r += 1
-        hk = self.cfg["hotkeys"]
         sec = self.cfg["security"]
-        inputs = "key presses or clicks" if self.cfg.get("wake_on_click", True) else "key presses"
-        if self.cfg.get("lock_on_sleep", True):
-            fp = " or a Windows Hello fingerprint" if self.fp.available() else ""
-            foot = (f"Locks Windows, then wakes the screens on {self.cfg['presses']} {inputs} within "
-                    f"{self.cfg['window_seconds']:g} s{fp}; your password or fingerprint gets you back in. ")
-        else:
-            fp = (", or a fingerprint" + (" (straight to the desktop)" if self.cfg.get("fingerprint_unlocks", False) else "")
-                  if self.cfg.get("fingerprint_wake", True) and self.fp.available() else "")
-            foot = f"Wakes on {self.cfg['presses']} {inputs} within {self.cfg['window_seconds']:g} s{fp}, to the lock screen. "
-        foot += (f"Mouse movement never wakes it.  Hotkeys: {hk.get('sleep')} sleep, {hk.get('panel')} panel, "
-                 f"{hk.get('brightness_up')} / {hk.get('brightness_down')} brightness.")
         if sec.get("last_summary"):
-            foot += f"\nSecurity ({sec.get('last_run', '')[:10]}): {sec['last_summary']}."
-        ttk.Label(f, text=foot, style="Dim.TLabel", wraplength=360).grid(row=r, column=0, columnspan=3, sticky="w")
+            ttk.Label(f, text=f"Security: {sec['last_summary']}", style="Dim.TLabel", wraplength=360).grid(
+                row=r, column=0, columnspan=3, sticky="w", pady=(8, 0))
+            r += 1
         f.columnconfigure(0, weight=1)
         self._refresh_power_ui()
         self._sun_strength_changed(None)
@@ -883,8 +871,6 @@ class App:
         self.in_combo = ttk.Combobox(irow, state="readonly", width=32)
         self.in_combo.pack(side="left", fill="x", expand=True, padx=(4, 4))
         self.in_combo.bind("<<ComboboxSelected>>", self._audio_pick_input)
-        self.audio_line = ttk.Label(f, text="", style="Dim.TLabel")
-        self.audio_line.grid(row=r, column=0, columnspan=3, sticky="w"); r += 1
         self._audio_sig = None
         self._refresh_audio_ui(force=True)
         return r
@@ -920,9 +906,6 @@ class App:
                 self.vol_val.set(v)
                 self.vol_lab.config(text=f"{v}%")
         self.mute_btn.config(text="\U0001F507" if snap.get("muted") else "\U0001F50A")
-        a = self.cfg["audio"]
-        on = a.get("auto_switch") and a.get("headphone_id") and a.get("speaker_id")
-        self.audio_line.config(text=(snap.get("auto") or "Auto-switch: headset ⇄ speakers") if on else "")
 
     def _audio_pick_output(self, e=None):
         did = getattr(self, "_out_map", {}).get(self.out_combo.get())
@@ -1007,8 +990,6 @@ class App:
                         (f" {st['gpu_power_w']:.0f} W" if st.get("gpu_power_w") else ""))
         if st.get("fans"):
             bits.append(f"fans {st['fans'][0]}/{st['fans'][1]} rpm")
-        if st.get("throttled"):
-            bits.append(f"{st['throttled']} apps slowed")
         if st.get("battery") is not None and not st.get("on_ac"):
             bits.append(f"battery {st['battery']:.0f}%")
         if st.get("thermal"):
@@ -1056,7 +1037,7 @@ class App:
         s = int(self.sun_strength.get())
         self.cfg["sun"]["strength"] = s
         f = self._sun_factor()
-        self.sun_lab.config(text=f"night {max(0, 100 - s)}%" + ("" if f >= 0.999 else f" · now x{f:.2f}"))
+        self.sun_lab.config(text=f"night {max(0, 100 - s)}%")
         if _v is not None:
             save_config(self.cfg)
             if self.cfg["sun"].get("enabled"):
