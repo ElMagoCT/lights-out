@@ -72,6 +72,8 @@ DEFAULTS = {
                 "brightness_up": "ctrl+alt+up", "brightness_down": "ctrl+alt+down"},
     "brightness_step": 10,
     "sun": {"enabled": False, "strength": 60, "transition_min": 45, "lat": None, "lon": None, "label": ""},
+    "audio": {"show_in_panel": True, "auto_switch": True, "headphone_id": "", "speaker_id": "",
+              "switch_mic": False, "mic_on_headphones_id": "", "mic_on_speakers_id": "", "poll_seconds": 3},
     "power": json.loads(json.dumps(E.DEFAULTS)),
     "claude": dict(CB.DEFAULTS),
     "security": {"weekly": True, "last_run": "", "last_summary": ""},
@@ -147,6 +149,7 @@ import sun                     # noqa: E402
 import security                # noqa: E402
 import fingerprint             # noqa: E402
 import topology                # noqa: E402
+import audio                   # noqa: E402
 from gate import WakeGate, session_locked  # noqa: E402
 
 user32 = ctypes.windll.user32
@@ -339,6 +342,9 @@ class App:
         self.sun_info = ""
         self.claude = CB.Claude(self.cfg["claude"], DATA_DIR)
         self.engine = E.Engine(self.cfg["power"], APP_DIR, DATA_DIR, on_change=self._on_profile)
+        self.audio = audio.AudioHub(self.cfg["audio"])
+        self._audio_dragging = False
+        self._audio_sig = None            # last device set drawn in the panel, to avoid needless rebuilds
         self.security_busy = False
         self._style()
         self._recover_from_crash()            # a previous instance died while asleep?
@@ -347,8 +353,10 @@ class App:
         self.hotkeys = Hotkeys(lambda name: self.post(self.on_hotkey, name))
         self.hotkeys.apply(self.cfg["hotkeys"])
         self.engine.start()
+        self.audio.start()
         self.root.after(100, self._pump)
         self.root.after(500, self._poll_signal)
+        self.root.after(2500, self._audio_prefill)
         self.root.after(3000, self._sun_tick)
         self.root.after(30_000, self._context_tick)
         self.root.after(90_000, self._security_tick)
@@ -786,6 +794,9 @@ class App:
                 sc.state(["disabled"])
             self.rows.append((m, val, lab, sc))
             r += 3
+        # -- audio --
+        if self.cfg["audio"].get("show_in_panel", True):
+            r = self._build_audio_section(f, r)
         opts = ttk.Frame(f)
         opts.grid(row=r, column=0, columnspan=3, sticky="we", pady=(10, 0))
         ttk.Checkbutton(opts, text="Move together", variable=self.link).pack(side="left")
@@ -836,7 +847,145 @@ class App:
         if not (self.panel and self.panel.winfo_exists()):
             return
         self._refresh_power_ui()
+        self._refresh_audio_ui()
         self.root.after(2000, self._panel_refresh)
+
+    # -- audio ----------------------------------------------------------------------
+    @staticmethod
+    def _short_audio(name):
+        s = name
+        if s.count("(") >= 2 and s.endswith(")"):      # drop a trailing "(driver)" group
+            s = s[:s.rfind("(")].strip()
+        return s if len(s) <= 40 else s[:39] + "…"
+
+    def _build_audio_section(self, f, r):
+        snap = self.audio.devices()
+        ttk.Label(f, text="Audio", style="Section.TLabel").grid(row=r, column=0, columnspan=3, sticky="w", pady=(12, 2)); r += 1
+        orow = ttk.Frame(f); orow.grid(row=r, column=0, columnspan=3, sticky="we"); r += 1
+        ttk.Label(orow, text="Out", style="Dim.TLabel", width=4).pack(side="left")
+        self.out_combo = ttk.Combobox(orow, state="readonly", width=32)
+        self.out_combo.pack(side="left", fill="x", expand=True, padx=(4, 4))
+        self.out_combo.bind("<<ComboboxSelected>>", self._audio_pick_output)
+        self.mute_btn = ttk.Button(orow, text="\U0001F50A", style="Flat.TButton", width=3, command=self._audio_toggle_mute)
+        self.mute_btn.pack(side="left")
+        vrow = ttk.Frame(f); vrow.grid(row=r, column=0, columnspan=3, sticky="we", pady=(2, 0)); r += 1
+        ttk.Label(vrow, text="Vol", style="Dim.TLabel", width=4).pack(side="left")
+        self.vol_val = tk.IntVar(value=snap.get("volume") or 0)
+        self.vol_scale = ttk.Scale(vrow, from_=0, to=100, orient="horizontal", variable=self.vol_val)
+        self.vol_scale.pack(side="left", fill="x", expand=True, padx=(4, 4))
+        self.vol_lab = ttk.Label(vrow, text="", style="Dim.TLabel", width=5, anchor="e"); self.vol_lab.pack(side="left")
+        self.vol_scale.bind("<Button-1>", self._audio_vol_press)
+        self.vol_scale.bind("<B1-Motion>", self._audio_vol_drag)
+        self.vol_scale.bind("<ButtonRelease-1>", self._audio_vol_release)
+        self.vol_scale.bind("<MouseWheel>", self._audio_vol_wheel)
+        irow = ttk.Frame(f); irow.grid(row=r, column=0, columnspan=3, sticky="we", pady=(2, 0)); r += 1
+        ttk.Label(irow, text="Mic", style="Dim.TLabel", width=4).pack(side="left")
+        self.in_combo = ttk.Combobox(irow, state="readonly", width=32)
+        self.in_combo.pack(side="left", fill="x", expand=True, padx=(4, 4))
+        self.in_combo.bind("<<ComboboxSelected>>", self._audio_pick_input)
+        self.audio_line = ttk.Label(f, text="", style="Dim.TLabel")
+        self.audio_line.grid(row=r, column=0, columnspan=3, sticky="w"); r += 1
+        self._audio_sig = None
+        self._refresh_audio_ui(force=True)
+        return r
+
+    def _refresh_audio_ui(self, force=False):
+        if not (self.panel and self.panel.winfo_exists() and getattr(self, "out_combo", None)):
+            return
+        try:
+            if not self.out_combo.winfo_exists():
+                return
+        except Exception:
+            return
+        snap = self.audio.devices()
+        outs = [d for d in snap.get("outputs", []) if d["state"] == audio.STATE_ACTIVE]
+        ins = [d for d in snap.get("inputs", []) if d["state"] == audio.STATE_ACTIVE]
+        sig = (tuple(d["id"] for d in outs), tuple(d["id"] for d in ins))
+        if force or sig != self._audio_sig:
+            self._out_map = {self._short_audio(d["name"]): d["id"] for d in outs}
+            self._in_map = {self._short_audio(d["name"]): d["id"] for d in ins}
+            self.out_combo["values"] = list(self._out_map)
+            self.in_combo["values"] = list(self._in_map)
+            self._audio_sig = sig
+        focused = self.panel.focus_get()
+        cur_out = next((n for n, i in getattr(self, "_out_map", {}).items() if i == snap.get("out_default")), None)
+        if cur_out and self.out_combo.get() != cur_out and focused is not self.out_combo:
+            self.out_combo.set(cur_out)
+        cur_in = next((n for n, i in getattr(self, "_in_map", {}).items() if i == snap.get("in_default")), None)
+        if cur_in and self.in_combo.get() != cur_in and focused is not self.in_combo:
+            self.in_combo.set(cur_in)
+        if not self._audio_dragging:
+            v = snap.get("volume")
+            if v is not None:
+                self.vol_val.set(v)
+                self.vol_lab.config(text=f"{v}%")
+        self.mute_btn.config(text="\U0001F507" if snap.get("muted") else "\U0001F50A")
+        a = self.cfg["audio"]
+        on = a.get("auto_switch") and a.get("headphone_id") and a.get("speaker_id")
+        self.audio_line.config(text=(snap.get("auto") or "Auto-switch: headset ⇄ speakers") if on else "")
+
+    def _audio_pick_output(self, e=None):
+        did = getattr(self, "_out_map", {}).get(self.out_combo.get())
+        if did:
+            self.audio.post("default", did)
+
+    def _audio_pick_input(self, e=None):
+        did = getattr(self, "_in_map", {}).get(self.in_combo.get())
+        if did:
+            self.audio.post("default_in", did)
+
+    def _audio_toggle_mute(self):
+        snap = self.audio.devices()
+        if snap.get("out_default"):
+            self.audio.post("mute", snap["out_default"], not bool(snap.get("muted")))
+
+    def _audio_vol_from_event(self, e):
+        w = self.vol_scale.winfo_width() or 1
+        return max(0, min(100, round(e.x / w * 100)))
+
+    def _audio_vol_apply(self, pct):
+        self.vol_val.set(pct)
+        if getattr(self, "vol_lab", None):
+            self.vol_lab.config(text=f"{pct}%")
+        od = self.audio.devices().get("out_default")
+        if od:
+            self.audio.post("volume", od, pct)
+
+    def _audio_vol_press(self, e):
+        self._audio_dragging = True
+        self._audio_vol_apply(self._audio_vol_from_event(e))
+
+    def _audio_vol_drag(self, e):
+        self._audio_vol_apply(self._audio_vol_from_event(e))
+
+    def _audio_vol_release(self, e):
+        self._audio_vol_apply(self._audio_vol_from_event(e))
+        self._audio_dragging = False
+
+    def _audio_vol_wheel(self, e):
+        self._audio_vol_apply(max(0, min(100, int(self.vol_val.get()) + (5 if e.delta > 0 else -5))))
+
+    def _audio_prefill(self):
+        a = self.cfg["audio"]
+        snap = self.audio.devices()
+        if not snap.get("outputs"):
+            self.root.after(2000, self._audio_prefill)         # hub still warming up
+            return
+        changed = False
+        if not a.get("headphone_id") and not a.get("speaker_id"):
+            hp, sp = audio.guess_pair(snap["outputs"])
+            if hp and sp:
+                a["headphone_id"], a["speaker_id"] = hp, sp
+                changed = True
+                log.info("audio pair guessed: headphones=%r speakers=%r",
+                         self.audio._devname(hp), self.audio._devname(sp))
+        if not a.get("mic_on_headphones_id") and not a.get("mic_on_speakers_id") and snap.get("inputs"):
+            mh, ms = audio.guess_mic_pair(snap["inputs"])
+            if mh or ms:
+                a["mic_on_headphones_id"], a["mic_on_speakers_id"] = mh, ms
+                changed = True
+        if changed:
+            save_config(self.cfg)
 
     def _refresh_power_ui(self):
         if not (self.panel and self.panel.winfo_exists()):
@@ -986,7 +1135,7 @@ class App:
         self.settings_nb = nb
         v = {}
         cfg = self.cfg
-        tabs = {name: ttk.Frame(nb, padding=14) for name in ("Sleep", "Power", "Display", "Claude", "Security")}
+        tabs = {name: ttk.Frame(nb, padding=14) for name in ("Sleep", "Power", "Display", "Audio", "Claude", "Security")}
         for name, fr in tabs.items():
             nb.add(fr, text=name)
 
@@ -1104,6 +1253,52 @@ class App:
                              ("Night light", "ms-settings:nightlight"), ("Auto HDR / graphics", "ms-settings:display-advancedgraphics")):
             ttk.Button(btns, text=text, style="Flat.TButton", command=lambda t=target: self.open_external(t)).pack(side="left", padx=(0, 6))
 
+        # Audio tab
+        f = tabs["Audio"]
+        au = cfg["audio"]
+        asnap = self.audio.devices()
+        a_outs = [d for d in asnap.get("outputs", []) if d["state"] == audio.STATE_ACTIVE] or asnap.get("outputs", [])
+        a_ins = [d for d in asnap.get("inputs", []) if d["state"] == audio.STATE_ACTIVE] or asnap.get("inputs", [])
+        out_map = {self._short_audio(d["name"]): d["id"] for d in a_outs}
+        in_map = {self._short_audio(d["name"]): d["id"] for d in a_ins}
+        # keep the configured device selectable even if it is unplugged right now
+        for did, lbl in ((au.get("headphone_id"), "headphones"), (au.get("speaker_id"), "speakers")):
+            if did and did not in out_map.values():
+                nm = next((self._short_audio(d["name"]) for d in asnap.get("outputs", []) if d["id"] == did), f"(saved {lbl})")
+                out_map[nm] = did
+        for did in (au.get("mic_on_headphones_id"), au.get("mic_on_speakers_id")):
+            if did and did not in in_map.values():
+                nm = next((self._short_audio(d["name"]) for d in asnap.get("inputs", []) if d["id"] == did), "(saved mic)")
+                in_map[nm] = did
+        self._settings_out_map, self._settings_in_map = out_map, in_map
+        id2out = {i: n for n, i in out_map.items()}
+        id2in = {i: n for n, i in in_map.items()}
+        r = 0
+        ttk.Label(f, text="Audio", style="Section.TLabel").grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        ttk.Label(f, text="Switch the output and input in the panel. Here you set the automatic switch between your "
+                          "headphones and speakers: when the headphones turn on (plugged in, or a wireless set powered "
+                          "on) the sound moves to them, and back to the speakers when they turn off.",
+                  style="Dim.TLabel", wraplength=560).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        v["a_panel"] = tk.BooleanVar(value=au.get("show_in_panel", True))
+        ttk.Checkbutton(f, text="Show audio controls in the panel", variable=v["a_panel"]).grid(row=r, column=0, columnspan=2, sticky="w", pady=(6, 0)); r += 1
+        v["a_auto"] = tk.BooleanVar(value=au.get("auto_switch", True))
+        ttk.Checkbutton(f, text="Automatically switch when my headphones turn on or off", variable=v["a_auto"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        v["a_hp"] = tk.StringVar(value=id2out.get(au.get("headphone_id"), ""))
+        v["a_sp"] = tk.StringVar(value=id2out.get(au.get("speaker_id"), ""))
+        r = row(f, r, "Headphones", ttk.Combobox(f, state="readonly", width=42, textvariable=v["a_hp"], values=list(out_map)))
+        r = row(f, r, "Speakers", ttk.Combobox(f, state="readonly", width=42, textvariable=v["a_sp"], values=list(out_map)))
+        v["a_mic"] = tk.BooleanVar(value=au.get("switch_mic", False))
+        ttk.Checkbutton(f, text="Also switch the microphone to match", variable=v["a_mic"]).grid(row=r, column=0, columnspan=2, sticky="w", pady=(6, 0)); r += 1
+        v["a_mh"] = tk.StringVar(value=id2in.get(au.get("mic_on_headphones_id"), ""))
+        v["a_ms"] = tk.StringVar(value=id2in.get(au.get("mic_on_speakers_id"), ""))
+        r = row(f, r, "Mic with headphones", ttk.Combobox(f, state="readonly", width=42, textvariable=v["a_mh"], values=list(in_map)))
+        r = row(f, r, "Mic with speakers", ttk.Combobox(f, state="readonly", width=42, textvariable=v["a_ms"], values=list(in_map)))
+        cur = next((self._short_audio(d["name"]) for d in asnap.get("outputs", []) if d["id"] == asnap.get("out_default")), "?")
+        ttk.Label(f, text=f"Default output now: {cur}", style="Dim.TLabel", wraplength=560).grid(row=r, column=0, columnspan=2, sticky="w", pady=(8, 0)); r += 1
+        ttk.Label(f, text="Note: if you route sound through Voicemeeter, automatic switching changes the Windows default "
+                          "device and may fight that setup — turn it off here if so.",
+                  style="Dim.TLabel", wraplength=560).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+
         # Claude tab
         f = tabs["Claude"]
         cl = cfg["claude"]
@@ -1214,10 +1409,19 @@ class App:
             if v["c_key"].get().strip():
                 cl["api_key_enc"] = CB.encrypt_key(v["c_key"].get().strip())
             cfg["security"]["weekly"] = bool(v["sec_weekly"].get())
+            au = cfg["audio"]
+            au["show_in_panel"] = bool(v["a_panel"].get())
+            au["auto_switch"] = bool(v["a_auto"].get())
+            au["headphone_id"] = self._settings_out_map.get(v["a_hp"].get(), au.get("headphone_id", ""))
+            au["speaker_id"] = self._settings_out_map.get(v["a_sp"].get(), au.get("speaker_id", ""))
+            au["switch_mic"] = bool(v["a_mic"].get())
+            au["mic_on_headphones_id"] = self._settings_in_map.get(v["a_mh"].get(), au.get("mic_on_headphones_id", ""))
+            au["mic_on_speakers_id"] = self._settings_in_map.get(v["a_ms"].get(), au.get("mic_on_speakers_id", ""))
         except Exception as e:
             self.settings_msg.config(text=f"Could not read a value: {e}")
             return
         save_config(cfg)
+        self.audio._last_hp = None            # re-evaluate the auto-switch against the new pair
         self.gate.presses, self.gate.window, self.gate.clicks = cfg["presses"], cfg["window_seconds"], cfg["wake_on_click"]
         self.hotkeys.apply(cfg["hotkeys"])
         self.engine.thr.cfg = cfg["power"].get("lists", {})
@@ -1527,6 +1731,10 @@ class App:
             self._restore_thread.join(15)        # a disconnected monitor must be back before we exit
         self.engine.stop()
         self.engine.join(8)
+        try:
+            self.audio.stop()
+        except Exception:
+            pass
         try:
             self.icon.stop()
         except Exception:

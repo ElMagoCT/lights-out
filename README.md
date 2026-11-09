@@ -25,6 +25,15 @@ computed locally from your location (detected once, or typed in), the level
 you set by day is scaled down at night by the strength you chose, with a
 smooth transition around dawn and dusk.
 
+**Audio.** Pick the output and input device right in the panel, with a volume
+slider and a mute button, so you never dig through the Sound settings. The
+smart part: name your headphones and your speakers once, and the default output
+follows them automatically. When the headphones turn on (plugged into the jack,
+or a wireless set powered on) sound moves to them, and back to the speakers
+when they turn off. The microphone can follow the same way. Device switching
+uses the same endpoint call the Sound control panel does; detection is a light
+poll of the audio endpoints, no driver or service.
+
 **Sleep.** Every monitor goes dark first and Windows locks after, so the
 lock screen is never drawn on a lit panel: brightness to 0, then DDC/CI
 standby where the monitor implements it. A monitor with no standby command
@@ -94,9 +103,9 @@ daily cap.
 |---|---|---|
 | ![Sleep tab](docs/settings-sleep.png) | ![Power tab](docs/settings-power.png) | ![Display tab](docs/settings-display.png) |
 
-| Claude | Security |
-|---|---|
-| ![Claude tab](docs/settings-claude.png) | ![Security tab](docs/settings-security.png) |
+| Audio | Claude | Security |
+|---|---|---|
+| ![Audio tab](docs/settings-audio.png) | ![Claude tab](docs/settings-claude.png) | ![Security tab](docs/settings-security.png) |
 
 ## How it is put together
 

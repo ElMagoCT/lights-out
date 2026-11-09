@@ -287,6 +287,38 @@ old low cap lifted to the new default once, on upgrade. Settings exposes the
 floor, ceiling, reserve, backstop and an on/off switch; the status line shows
 the current rate.
 
+## Audio controls and headphone auto-switch, 2026-11-08
+
+Added `audio.py`: device list, default-endpoint read/set, volume/mute, and an
+auto-switch that follows a headphone/speaker pair. Core Audio (MMDevice,
+IAudioEndpointVolume) is reached through hand-defined comtypes interfaces, so
+nothing but comtypes is added and PyInstaller bundles it without a generated
+type-library cache. Setting the default endpoint is the one undocumented call,
+IPolicyConfig::SetDefaultEndpoint, applied for all three roles, the same call
+the Sound control panel uses. All COM runs on one worker thread (AudioHub); the
+UI reads a cached snapshot and posts actions, so nothing blocks Tk and no COM
+pointer crosses threads.
+
+The panel gained an output selector with a volume slider and mute, plus an
+input selector. A Settings tab sets the headphone and speaker devices (guessed
+on first run by form factor and name, verified correct on this machine:
+Corsair VOID ELITE headset and Logitech USB speakers), an on/off switch, and an
+optional microphone-follow with its own pair.
+
+Detection is a light poll of endpoint states every few seconds. On startup the
+current output is left alone (baseline only); thereafter, when the headphone
+endpoint changes to or from ACTIVE the default output switches to the headphones
+or the speakers. Verified: endpoint enumeration, a default switch to the headset
+and back, volume read/write, and the transition logic across startup, off, no-
+change, and on (no yank at launch, no duplicate switches). The watchdog/sleep
+paths are untouched by this.
+
+One gotcha: naming the hub's device-name helper `_name` silently shadowed
+`threading.Thread._name` (the thread's own name string), so `self._name(id)`
+raised "str object is not callable"; renamed to `_devname`. Also noted for
+Voicemeeter users: auto-switch changes the Windows default device and can fight
+a Voicemeeter-as-default setup, so the tab says to turn it off in that case.
+
 ## Open items
 
 - Confirm the fingerprint wake with a real touch on another unit.
