@@ -111,13 +111,21 @@ def load_config():
     cfg = json.loads(json.dumps(DEFAULTS))
     old = os.path.join(APP_DIR, "config.json")
     src = CONFIG_PATH if os.path.exists(CONFIG_PATH) else (old if os.path.exists(old) else None)
+    saved = {}
     if src:
         try:
             with open(src, encoding="utf-8") as f:
-                _merge(cfg, json.load(f))
+                saved = json.load(f)
+            _merge(cfg, saved)
         except Exception:
             log.exception("config unreadable, using defaults")
     cfg.pop("schedule", None)                      # replaced by sun sync
+    # Migration: a config written before the adaptive budget stored a low flat cap
+    # (old default 20). Left as-is it would throttle the new scaling budget, so lift
+    # it to the new default once, when upgrading.
+    cl = cfg.get("claude", {})
+    if "rate_adaptive" not in saved.get("claude", {}) and int(cl.get("daily_call_cap", 0)) <= 20:
+        cl["daily_call_cap"] = CB.DEFAULTS["daily_call_cap"]
     save_config(cfg)
     return cfg
 
@@ -531,12 +539,26 @@ class App:
     def _on_profile(self, profile, why):
         if self.icon:
             self.icon.title = f"Lights Out - {profile}: {why}"[:120]
+        self._update_claude_load()
+
+    # how busy the machine is, 0..1, so the Claude call budget can scale with it:
+    # idle sits at the floor rate, a gaming / max session climbs to the ceiling.
+    _PROFILE_LOAD = {"quiet": 0.0, "balanced": 0.2, "performance": 0.7, "max": 1.0}
+
+    def _update_claude_load(self):
+        try:
+            st = self.engine.snapshot()
+            load = max(self._PROFILE_LOAD.get(st.get("profile"), 0.0), (st.get("pressure") or 0) / 100.0)
+            self.claude.set_load(load)
+        except Exception:
+            pass
 
     def _context_tick(self):
         try:
             self.engine.set_context(locked=bool(session_locked()))
         except Exception:
             pass
+        self._update_claude_load()
         self.root.after(30_000, self._context_tick)
 
     def _classify_tick(self):
@@ -1088,7 +1110,8 @@ class App:
         r = 0
         ttk.Label(f, text="Claude", style="Section.TLabel").grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
         ttk.Label(f, text="Used for two things only: a one-time cheap classification of unknown background apps, and the "
-                          "write-up of the security assessment. Everything is cached and capped per day.",
+                          "write-up of the security assessment. Everything is cached; the call budget scales with how "
+                          "busy the machine is.",
                   style="Dim.TLabel", wraplength=560).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
         v["c_mode"] = tk.StringVar(value=cl.get("mode", "cli"))
         mf = ttk.Frame(f)
@@ -1097,11 +1120,27 @@ class App:
         r = row(f, r, "Use", mf)
         v["c_key"] = tk.StringVar(value="")
         r = row(f, r, "API key (saved encrypted; leave blank to keep)", ttk.Entry(f, textvariable=v["c_key"], width=46, show="•"))
-        v["c_model"] = tk.StringVar(value=cl.get("api_model", CB.GOOD_MODEL)); v["c_cap"] = tk.IntVar(value=cl.get("daily_call_cap", 20))
+        v["c_model"] = tk.StringVar(value=cl.get("api_model", CB.GOOD_MODEL))
         r = row(f, r, "API model for reports", ttk.Entry(f, textvariable=v["c_model"], width=30))
-        r = row(f, r, "Daily call cap", ttk.Spinbox(f, from_=1, to=500, width=5, textvariable=v["c_cap"]))
+        v["c_adaptive"] = tk.BooleanVar(value=cl.get("rate_adaptive", True))
+        ttk.Checkbutton(f, text="Scale the call budget with how busy the machine is (gaming-aware)",
+                        variable=v["c_adaptive"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        v["c_rmin"] = tk.DoubleVar(value=cl.get("rate_min_per_hour", 0.5))
+        v["c_rmax"] = tk.DoubleVar(value=cl.get("rate_max_per_hour", 15.0))
+        v["c_reserve"] = tk.IntVar(value=cl.get("daily_reserve", 3))
+        v["c_cap"] = tk.IntVar(value=cl.get("daily_call_cap", 20))
+        rf = ttk.Frame(f)
+        ttk.Label(rf, text="idle").pack(side="left")
+        ttk.Spinbox(rf, from_=0, to=60, increment=0.5, width=5, textvariable=v["c_rmin"]).pack(side="left", padx=(4, 2))
+        ttk.Label(rf, text="to busy").pack(side="left")
+        ttk.Spinbox(rf, from_=1, to=120, increment=1, width=5, textvariable=v["c_rmax"]).pack(side="left", padx=(4, 2))
+        ttk.Label(rf, text="calls/hour,  + reserve/day").pack(side="left")
+        ttk.Spinbox(rf, from_=0, to=50, width=4, textvariable=v["c_reserve"]).pack(side="left", padx=(4, 0))
+        r = row(f, r, "Rate scales", rf)
+        r = row(f, r, "Absolute daily backstop", ttk.Spinbox(f, from_=1, to=1000, width=6, textvariable=v["c_cap"]))
         u = self.claude.usage.get(dt.date.today().isoformat(), {})
-        ttk.Label(f, text=f"Status: {self.claude.status()}\nToday: {u.get('calls', 0)} calls, {u.get('in', 0)} in / {u.get('out', 0)} out tokens"
+        ttk.Label(f, text=f"Status: {self.claude.status()}\n{self.claude.budget()}\n"
+                          f"Today: {u.get('calls', 0)} calls, {u.get('in', 0)} in / {u.get('out', 0)} out tokens"
                           + (f", ${u.get('usd', 0):.3f}" if u.get("usd") else ""), style="Dim.TLabel", wraplength=560).grid(row=r, column=0, columnspan=2, sticky="w", pady=(8, 0)); r += 1
         ttk.Label(f, text="CLI sign-in: open a terminal, type `claude`, then `/login` once. No key needed after that.",
                   style="Dim.TLabel", wraplength=560).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
@@ -1166,7 +1205,12 @@ class App:
             if s["lat"] is None and os.path.exists(GEO_PATH):
                 os.remove(GEO_PATH)
             cl = cfg["claude"]
-            cl["mode"] = v["c_mode"].get(); cl["api_model"] = v["c_model"].get().strip() or CB.GOOD_MODEL; cl["daily_call_cap"] = int(v["c_cap"].get())
+            cl["mode"] = v["c_mode"].get(); cl["api_model"] = v["c_model"].get().strip() or CB.GOOD_MODEL
+            cl["rate_adaptive"] = bool(v["c_adaptive"].get())
+            cl["rate_min_per_hour"] = max(0.0, float(v["c_rmin"].get()))
+            cl["rate_max_per_hour"] = max(cl["rate_min_per_hour"], float(v["c_rmax"].get()))
+            cl["daily_reserve"] = max(0, int(v["c_reserve"].get()))
+            cl["daily_call_cap"] = max(1, int(v["c_cap"].get()))
             if v["c_key"].get().strip():
                 cl["api_key_enc"] = CB.encrypt_key(v["c_key"].get().strip())
             cfg["security"]["weekly"] = bool(v["sec_weekly"].get())

@@ -265,6 +265,28 @@ the live display configuration at each sleep and writes it to the sentinel
 fresh, but any stored display identifier must be treated as per-session, not
 persistent.
 
+## Adaptive Claude call budget, 2026-11-08
+
+The flat daily cap (20/day) was replaced with a budget that scales with how
+busy the machine is, so classifications keep up during a gaming or heavy
+session and cost almost nothing when idle. A token bucket meters calls at a
+rate that moves between a floor (default 0.5/hour) and a ceiling (15/hour) with
+a projection = the greater of recent actual demand and a live 0..1 intensity
+hint the app feeds from the power engine (profile tier and the 30-second
+CPU/GPU pressure). On top of the hourly rate sits a small daily reserve
+(default 3) and an absolute daily backstop (default 120) against a runaway
+loop. Over-projection self-corrects: when a session ends, intensity drops to 0
+and the trailing demand window empties, so the rate falls back to the floor.
+
+Verified with a simulated clock: floor grants one starter token plus the three
+reserve calls and then one call per two hours; the ceiling serves fifteen in an
+hour; intensity rising to 1 lifts the rate to 15/hour at once; it decays to 0.5
+when idle; the backstop blocks past its limit; and the fixed-cap mode still
+works when adaptive is turned off. A config written before this change has its
+old low cap lifted to the new default once, on upgrade. Settings exposes the
+floor, ceiling, reserve, backstop and an on/off switch; the status line shows
+the current rate.
+
 ## Open items
 
 - Confirm the fingerprint wake with a real touch on another unit.

@@ -17,6 +17,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 import urllib.request
 
 log = logging.getLogger("lightsout.claude")
@@ -24,7 +25,12 @@ NOWIN = 0x08000000
 CHEAP_MODEL = "claude-haiku-4-5-20251001"
 GOOD_MODEL = "claude-sonnet-5"
 DEFAULTS = {"mode": "cli", "cli_path": "", "api_key_enc": "", "api_model": GOOD_MODEL,
-            "cheap_model": CHEAP_MODEL, "daily_call_cap": 20}
+            "cheap_model": CHEAP_MODEL,
+            # Adaptive budget: the allowed rate scales between a floor and a ceiling
+            # (calls/hour) with projected demand, plus a small daily reserve on top.
+            "rate_adaptive": True, "rate_min_per_hour": 0.5, "rate_max_per_hour": 15.0,
+            "daily_reserve": 3,
+            "daily_call_cap": 120}           # daily maximum: a backstop when adaptive, a flat cap when not
 
 
 # -- DPAPI --------------------------------------------------------------------------
@@ -68,6 +74,111 @@ def find_cli():
     return ""
 
 
+def _load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+class RateLimiter:
+    """Adaptive call budget for the Claude bridge.
+
+    The allowed rate scales between a floor and a ceiling (calls/hour) with
+    projected demand; on top of that sits a small daily reserve. The projection
+    is the greater of recent actual demand and a live 'intensity' hint from the
+    power engine, which runs high during a gaming or heavy session where new
+    processes need classifying. So a busy session ramps straight to the ceiling,
+    while a quiet stretch that had been projected high decays back to the floor.
+    A token bucket does the metering, so a fractional floor (0.5/hour = one call
+    every two hours) works cleanly, and an absolute daily backstop guards against
+    a runaway loop."""
+
+    def __init__(self, cfg, path):
+        self.cfg = cfg
+        self.path = path
+        self.intensity = 0.0
+        self.st = _load_json(path, {})
+        if "last" not in self.st:
+            self.st = {"tokens": 1.0, "last": time.time(), "demand": [],
+                       "reserve_date": "", "reserve_used": 0, "served_date": "", "served": 0}
+
+    def _f(self, k, d):
+        try:
+            return float(self.cfg.get(k, d))
+        except Exception:
+            return d
+
+    def set_intensity(self, x):
+        try:
+            self.intensity = max(0.0, min(1.0, float(x)))
+        except Exception:
+            self.intensity = 0.0
+
+    def _bounds(self):
+        lo = max(0.0, self._f("rate_min_per_hour", 0.5))
+        hi = max(lo, self._f("rate_max_per_hour", 15.0))
+        return lo, hi
+
+    def projection(self, now):
+        lo, hi = self._bounds()
+        self.st["demand"] = [t for t in self.st.get("demand", []) if now - t < 3600]
+        demand_rate = len(self.st["demand"])                 # wanted calls in the last hour
+        d = demand_rate / hi if hi else 0.0
+        return max(0.0, min(1.0, max(d, self.intensity)))
+
+    def rate_now(self, now=None):
+        now = time.time() if now is None else now
+        lo, hi = self._bounds()
+        return lo + (hi - lo) * self.projection(now)
+
+    def _save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.st, f)
+        except Exception:
+            log.exception("rate state save")
+
+    def check(self, now=None, record=True):
+        """(allowed, reason, rate_now). record=False peeks without spending."""
+        now = time.time() if now is None else now
+        today = dt.date.today().isoformat()
+        if self.st.get("reserve_date") != today:
+            self.st["reserve_date"], self.st["reserve_used"] = today, 0
+        if self.st.get("served_date") != today:
+            self.st["served_date"], self.st["served"] = today, 0
+        r = self.rate_now(now)                               # prunes demand too
+        cap = max(1.0, r)                                    # hold at least one token so the floor can fire
+        elapsed = max(0.0, now - self.st.get("last", now))
+        self.st["tokens"] = min(cap, self.st.get("tokens", cap) + elapsed / 3600.0 * r)
+        self.st["last"] = now
+        if record:
+            self.st["demand"].append(now)
+        hard = int(self._f("daily_call_cap", 120))
+        reserve = int(self._f("daily_reserve", 3))
+        reserve_left = max(0, reserve - int(self.st.get("reserve_used", 0)))
+        allowed, reason = False, ""
+        if int(self.st.get("served", 0)) >= hard:
+            reason = f"Claude daily backstop reached ({hard} calls); raise it in Settings"
+        elif self.st.get("tokens", 0.0) >= 1.0:
+            allowed = True
+            if record:
+                self.st["tokens"] -= 1.0
+        elif reserve_left > 0:
+            allowed = True
+            if record:
+                self.st["reserve_used"] = int(self.st.get("reserve_used", 0)) + 1
+        else:
+            mins = (1.0 - self.st.get("tokens", 0.0)) / r * 60 if r > 0 else 9999
+            reason = f"Claude rate limit: about {r:.1f} calls/hour right now and the daily reserve is spent; next call in ~{mins:.0f} min"
+        if allowed and record:
+            self.st["served"] = int(self.st.get("served", 0)) + 1
+        if record:
+            self._save()
+        return allowed, reason, r
+
+
 class Claude:
     def __init__(self, cfg, data_dir):
         self.cfg = cfg                                   # the "claude" dict (live)
@@ -75,7 +186,15 @@ class Claude:
         self.cache_path = os.path.join(data_dir, "claude_cache.json")
         self.usage = self._load(self.usage_path, {})
         self.cache = self._load(self.cache_path, {})
+        self.limiter = RateLimiter(cfg, os.path.join(data_dir, "claude_rate.json"))
         self.last_error = ""
+
+    def set_load(self, intensity):
+        """0..1 hint from the power engine; raises the projected rate while busy."""
+        self.limiter.set_intensity(intensity)
+
+    def rate_now(self):
+        return self.limiter.rate_now()
 
     @staticmethod
     def _load(path, default):
@@ -102,6 +221,16 @@ class Claude:
             return "CLI mode: `claude` not found (install Claude Code, or switch to an API key)"
         return f"CLI mode: {os.path.basename(cli)}" + (f" ({self.last_error})" if self.last_error else "")
 
+    def budget(self):
+        """One line on the current budget, for Settings."""
+        if not self.cfg.get("rate_adaptive", True):
+            return f"Fixed cap: {self.calls_today()}/{int(self.cfg.get('daily_call_cap', 20))} calls today"
+        lo = self.cfg.get("rate_min_per_hour", 0.5)
+        hi = self.cfg.get("rate_max_per_hour", 15.0)
+        res = max(0, int(self.cfg.get("daily_reserve", 3)) - int(self.limiter.st.get("reserve_used", 0)))
+        return (f"Adaptive: ~{self.rate_now():.1f} calls/hr now (scales {lo:g}-{hi:g}/hr with load), "
+                f"{res} reserve left today")
+
     def calls_today(self):
         return self.usage.get(dt.date.today().isoformat(), {}).get("calls", 0)
 
@@ -122,7 +251,11 @@ class Claude:
         """Returns (text, error). Cached answers cost nothing."""
         if cache_key and cache_key in self.cache:
             return self.cache[cache_key], ""
-        if self.calls_today() >= int(self.cfg.get("daily_call_cap", 20)):
+        if self.cfg.get("rate_adaptive", True):
+            ok, why, _ = self.limiter.check()
+            if not ok:
+                return "", why
+        elif self.calls_today() >= int(self.cfg.get("daily_call_cap", 20)):
             return "", "daily Claude call cap reached (raise it in Settings)"
         mode = self.cfg.get("mode", "cli")
         text, err = (self._api(prompt, cheap, max_tokens) if mode == "api" else self._cli(prompt, cheap))

@@ -80,8 +80,13 @@ is set up. Weekly by default.
 **Claude.** Used for two things only: a one-time, cached classification of
 unknown heavy background apps (so nothing important gets slowed) and the
 security write-up. Either the Claude Code CLI on the machine, billed to your
-account, or an API key stored DPAPI-encrypted. Daily call cap and a usage
-counter in Settings.
+account, or an API key stored DPAPI-encrypted. The call budget is adaptive: it
+scales with how busy the machine is, from a floor when idle (0.5/hour plus a
+small daily reserve) up to a ceiling during a gaming or heavy session
+(15/hour), so classifications keep up when profiles are changing fast and cost
+almost nothing when they are not. An absolute daily backstop and a usage
+counter sit in Settings, and the whole thing can be switched back to a flat
+daily cap.
 
 ## Screenshots
 
