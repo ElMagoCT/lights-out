@@ -278,9 +278,21 @@ class Claude:
                                creationflags=NOWIN, env=env, encoding="utf-8", errors="replace")
         except Exception as e:
             return "", f"claude CLI failed to run: {e}"
-        try:
-            d = json.loads(r.stdout.strip().splitlines()[-1])
-        except Exception:
+        # The CLI prints stray warnings (e.g. "Client.listTools() ...") around the
+        # JSON, so scan for the result object instead of assuming it is the last line.
+        d = None
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not (line.startswith("{") and line.endswith("}")):
+                continue
+            try:
+                cand = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(cand, dict) and ("result" in cand or "is_error" in cand or cand.get("type") == "result"):
+                d = cand
+                break
+        if d is None:
             return "", f"claude CLI gave no answer: {(r.stderr or r.stdout)[:200].strip()}"
         if d.get("is_error"):
             msg = str(d.get("result", ""))[:200]

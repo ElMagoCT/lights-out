@@ -37,6 +37,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 LOG_PATH = os.path.join(DATA_DIR, "lightsout.log")
 SIGNAL_PATH = os.path.join(DATA_DIR, ".open-panel")
+SLEEP_SIGNAL_PATH = os.path.join(DATA_DIR, ".sleep-now")   # drop this file to put the screens to sleep
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
 GEO_PATH = os.path.join(DATA_DIR, "location.json")
 REPORT_DIR = os.path.join(DATA_DIR, "reports")
@@ -491,6 +492,14 @@ class App:
                 pass
             if not self.asleep:
                 self.show_panel()
+        if os.path.exists(SLEEP_SIGNAL_PATH):
+            try:
+                os.remove(SLEEP_SIGNAL_PATH)
+            except OSError:
+                pass
+            if not self.asleep:
+                log.info("sleep requested via signal file")
+                self.sleep()
         self.root.after(500, self._poll_signal)
 
     def _start_tray(self):
