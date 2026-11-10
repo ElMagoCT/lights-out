@@ -408,6 +408,104 @@ def enumerate_monitors(probe_wmi=True, retries=6):
     return mons
 
 
+# --- temporary resolution change (the remote-desktop 16:9 mode) --------------
+# Why: the main monitor here is a 21:9 ultrawide; a Chrome Remote Desktop client
+# is far easier to use if it is switched to a plain 16:9 mode for the session and
+# put back after. CDS_FULLSCREEN changes the mode without saving it to the user
+# profile, so reset_resolution (or any reboot) restores the real one.
+CCHDEVICENAME = 32
+CCHFORMNAME = 32
+ENUM_CURRENT_SETTINGS = 0xFFFFFFFF
+DM_PELSWIDTH = 0x00080000
+DM_PELSHEIGHT = 0x00100000
+CDS_TEST = 0x02
+CDS_FULLSCREEN = 0x04
+DISP_CHANGE_SUCCESSFUL = 0
+
+
+class DEVMODEW(ctypes.Structure):
+    _fields_ = [
+        ("dmDeviceName", ctypes.c_wchar * CCHDEVICENAME),
+        ("dmSpecVersion", wt.WORD), ("dmDriverVersion", wt.WORD),
+        ("dmSize", wt.WORD), ("dmDriverExtra", wt.WORD),
+        ("dmFields", wt.DWORD),
+        ("dmPositionX", wt.LONG), ("dmPositionY", wt.LONG),
+        ("dmDisplayOrientation", wt.DWORD), ("dmDisplayFixedOutput", wt.DWORD),
+        ("dmColor", ctypes.c_short), ("dmDuplex", ctypes.c_short),
+        ("dmYResolution", ctypes.c_short), ("dmTTOption", ctypes.c_short),
+        ("dmCollate", ctypes.c_short), ("dmFormName", ctypes.c_wchar * CCHFORMNAME),
+        ("dmLogPixels", wt.WORD),
+        ("dmBitsPerPel", wt.DWORD), ("dmPelsWidth", wt.DWORD), ("dmPelsHeight", wt.DWORD),
+        ("dmDisplayFlags", wt.DWORD), ("dmDisplayFrequency", wt.DWORD),
+        ("dmICMMethod", wt.DWORD), ("dmICMIntent", wt.DWORD),
+        ("dmMediaType", wt.DWORD), ("dmDitherType", wt.DWORD),
+        ("dmReserved1", wt.DWORD), ("dmReserved2", wt.DWORD),
+        ("dmPanningWidth", wt.DWORD), ("dmPanningHeight", wt.DWORD),
+    ]
+
+
+user32.EnumDisplaySettingsW.argtypes = [wt.LPCWSTR, wt.DWORD, ctypes.POINTER(DEVMODEW)]
+user32.EnumDisplaySettingsW.restype = wt.BOOL
+user32.ChangeDisplaySettingsExW.argtypes = [wt.LPCWSTR, ctypes.POINTER(DEVMODEW), wt.HWND, wt.DWORD, ctypes.c_void_p]
+user32.ChangeDisplaySettingsExW.restype = wt.LONG
+
+
+def _current_mode(device):
+    dm = DEVMODEW()
+    dm.dmSize = ctypes.sizeof(DEVMODEW)
+    if user32.EnumDisplaySettingsW(device, ENUM_CURRENT_SETTINGS, ctypes.byref(dm)):
+        return dm
+    return None
+
+
+def list_modes(device):
+    """Every (width, height) the display advertises, de-duplicated and sorted."""
+    out, i = [], 0
+    while True:
+        dm = DEVMODEW()
+        dm.dmSize = ctypes.sizeof(DEVMODEW)
+        if not user32.EnumDisplaySettingsW(device, i, ctypes.byref(dm)):
+            break
+        out.append((dm.dmPelsWidth, dm.dmPelsHeight))
+        i += 1
+    return sorted(set(out))
+
+
+def best_16x9_mode(device, tol=0.02):
+    """The widest 16:9 mode no wider than the current one, or None when the
+    display is already 16:9 (nothing to change) or lists no 16:9 mode."""
+    cur = _current_mode(device)
+    if cur is None or not cur.dmPelsHeight:
+        return None
+    cur_w, cur_h = cur.dmPelsWidth, cur.dmPelsHeight
+    if abs(cur_w / cur_h - 16 / 9) <= tol:
+        return None
+    cand = [(w, h) for (w, h) in list_modes(device)
+            if h and abs(w / h - 16 / 9) <= tol and w <= cur_w]
+    return max(cand, key=lambda wh: wh[0] * wh[1]) if cand else None
+
+
+def set_resolution(device, width, height, test=False):
+    """Switch a display to width x height temporarily (CDS_FULLSCREEN, not saved
+    to the profile). test=True validates the mode without changing anything."""
+    dm = _current_mode(device)
+    if dm is None:
+        return False
+    dm.dmPelsWidth, dm.dmPelsHeight = int(width), int(height)
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT
+    flags = CDS_TEST if test else CDS_FULLSCREEN
+    rc = user32.ChangeDisplaySettingsExW(device, ctypes.byref(dm), None, flags, None)
+    if rc != DISP_CHANGE_SUCCESSFUL:
+        log.warning("set %s to %dx%d -> rc %s", device, width, height, rc)
+    return rc == DISP_CHANGE_SUCCESSFUL
+
+
+def reset_resolution(device):
+    """Undo a set_resolution: back to the display's saved mode."""
+    rc = user32.ChangeDisplaySettingsExW(device, None, None, 0, None)
+    return rc == DISP_CHANGE_SUCCESSFUL
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     for m in enumerate_monitors():

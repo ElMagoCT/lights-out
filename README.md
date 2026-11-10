@@ -53,6 +53,18 @@ at sleep is a switch in Settings; off, the desktop stays unlocked behind the
 black screens, keys and clicks are swallowed, the app's own fingerprint
 session wakes it, and Windows is locked on the way out instead.
 
+**Remote desktop.** If a Chrome Remote Desktop client connects while asleep,
+the main monitor comes on at 16:9 (an ultrawide is awkward to remote into) and
+the others stay off, so there is a clean single display to work on. Windows
+stays locked — you sign in once through the remote session; the app never
+stores or types your password and never bypasses the lock. The power engine
+comes back to life so a remote gaming or work session scales normally. When the
+session ends, or a real key is pressed at the desk ("switched to manual"), it
+locks and goes back to the dark sleep state. The connect and disconnect are read
+straight from the CRD host's own entries in the Windows event log; a keystroke
+is known to be local because Remote Desktop types with injected input, which the
+keyboard hook can tell from a key pressed at the desk.
+
 **Safety net.** While asleep the tray app heartbeats to the helper. If it
 ever dies or hangs, the helper locks Windows, shows the taskbar, wakes the
 monitors and restores brightness within about ten seconds; a fresh start does
@@ -186,3 +198,9 @@ Stop the tray instance first; the self-test only opens its panel otherwise.
   create its queue before anyone posts to it.
 - `WinBioOpenSession` on the system fingerprint pool works without elevation,
   `WinBioIdentify` blocks until a touch, `WinBioCancel` unblocks it.
+- Chrome Remote Desktop logs every connect (event ID 1) and disconnect (ID 2)
+  to the Application event log under provider `chromoting`; `EvtSubscribe` in
+  pull mode turns that into a push signal with no polling and no log tailing.
+- A remote client types with injected input (`LLKHF_INJECTED`); a key pressed at
+  the desk is not flagged, which is the whole basis for telling a person taking
+  over from the remote user's own typing.

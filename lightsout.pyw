@@ -75,6 +75,7 @@ DEFAULTS = {
     "sun": {"enabled": False, "strength": 60, "transition_min": 45, "lat": None, "lon": None, "label": ""},
     "audio": {"show_in_panel": True, "auto_switch": True, "headphone_id": "", "speaker_id": "",
               "switch_mic": False, "mic_on_headphones_id": "", "mic_on_speakers_id": "", "poll_seconds": 3},
+    "remote": {"enabled": True, "wide_to_16x9": True, "width": 0, "height": 0, "lock_on_physical": True},
     "power": json.loads(json.dumps(E.DEFAULTS)),
     "claude": dict(CB.DEFAULTS),
     "security": {"weekly": True, "last_run": "", "last_summary": ""},
@@ -151,7 +152,8 @@ import security                # noqa: E402
 import fingerprint             # noqa: E402
 import topology                # noqa: E402
 import audio                   # noqa: E402
-from gate import WakeGate, session_locked  # noqa: E402
+import remote                  # noqa: E402
+from gate import WakeGate, PhysicalKeyWatcher, session_locked  # noqa: E402
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -333,6 +335,12 @@ class App:
         self.writer = LatestWriter()
         self.gate = WakeGate(int(self.cfg["presses"]), float(self.cfg["window_seconds"]), clicks=bool(self.cfg.get("wake_on_click", True)))
         self.fp = fingerprint.FingerprintWatcher()
+        self.crd = remote.CrdWatcher()            # Chrome Remote Desktop connect/disconnect while asleep
+        self.pkw = PhysicalKeyWatcher()           # a real keystroke taking over a remote session
+        self.remote_active = False                # a remote-desktop session is driving the main monitor
+        self._remote_main = None                  # device name of the monitor brought up for it
+        self._remote_resized = False              # its resolution was switched to 16:9
+        self._remote_lock = threading.Lock()      # serialise enter/exit display work
         self._wake_lock = threading.Lock()
         self._wake_done = False
         self.last_wake_why = ""
@@ -1125,7 +1133,7 @@ class App:
         self.settings_nb = nb
         v = {}
         cfg = self.cfg
-        tabs = {name: ttk.Frame(nb, padding=14) for name in ("Sleep", "Power", "Display", "Audio", "Claude", "Security")}
+        tabs = {name: ttk.Frame(nb, padding=14) for name in ("Sleep", "Power", "Display", "Audio", "Remote", "Claude", "Security")}
         for name, fr in tabs.items():
             nb.add(fr, text=name)
 
@@ -1289,6 +1297,29 @@ class App:
                           "device and may fight that setup — turn it off here if so.",
                   style="Dim.TLabel", wraplength=560).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
 
+        # Remote tab
+        f = tabs["Remote"]
+        rc_ = cfg.get("remote", {})
+        r = 0
+        ttk.Label(f, text="Remote desktop (Chrome Remote Desktop)", style="Section.TLabel").grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        ttk.Label(f, text="When a Chrome Remote Desktop client connects while asleep, the main monitor comes on at 16:9 for "
+                          "the session and the others stay off. Windows stays locked — you sign in once through the remote "
+                          "session (this never stores or types your password). On disconnect, or a real keystroke at the "
+                          "desk, it locks and goes back to the dark sleep state.",
+                  style="Dim.TLabel", wraplength=560).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        v["r_enabled"] = tk.BooleanVar(value=rc_.get("enabled", True))
+        ttk.Checkbutton(f, text="Bring the main monitor up for a remote-desktop session", variable=v["r_enabled"]).grid(row=r, column=0, columnspan=2, sticky="w", pady=(6, 0)); r += 1
+        v["r_16x9"] = tk.BooleanVar(value=rc_.get("wide_to_16x9", True))
+        ttk.Checkbutton(f, text="Switch the main monitor to 16:9 for the session (an ultrawide is awkward to remote into)", variable=v["r_16x9"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        v["r_w"] = tk.IntVar(value=int(rc_.get("width") or 0)); v["r_h"] = tk.IntVar(value=int(rc_.get("height") or 0))
+        r = row(f, r, "16:9 width (0 = pick the best one)", ttk.Spinbox(f, from_=0, to=5120, increment=10, width=7, textvariable=v["r_w"]))
+        r = row(f, r, "16:9 height (0 = auto)", ttk.Spinbox(f, from_=0, to=2880, increment=10, width=7, textvariable=v["r_h"]))
+        v["r_lock_phys"] = tk.BooleanVar(value=rc_.get("lock_on_physical", True))
+        ttk.Checkbutton(f, text='A real keystroke at the desk ends the session and locks ("switched to manual")', variable=v["r_lock_phys"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        crd_note = "Chrome Remote Desktop host detected." if remote.available() else "event-log API unavailable."
+        ttk.Label(f, text=crd_note + " Detection reads the host's connect/disconnect events from the Windows log; it never "
+                          "unlocks Windows for you.", style="Dim.TLabel", wraplength=560).grid(row=r, column=0, columnspan=2, sticky="w", pady=(8, 0)); r += 1
+
         # Claude tab
         f = tabs["Claude"]
         cl = cfg["claude"]
@@ -1407,6 +1438,12 @@ class App:
             au["switch_mic"] = bool(v["a_mic"].get())
             au["mic_on_headphones_id"] = self._settings_in_map.get(v["a_mh"].get(), au.get("mic_on_headphones_id", ""))
             au["mic_on_speakers_id"] = self._settings_in_map.get(v["a_ms"].get(), au.get("mic_on_speakers_id", ""))
+            rem = cfg.setdefault("remote", {})
+            rem["enabled"] = bool(v["r_enabled"].get())
+            rem["wide_to_16x9"] = bool(v["r_16x9"].get())
+            rem["width"] = max(0, int(v["r_w"].get()))
+            rem["height"] = max(0, int(v["r_h"].get()))
+            rem["lock_on_physical"] = bool(v["r_lock_phys"].get())
         except Exception as e:
             self.settings_msg.config(text=f"Could not read a value: {e}")
             return
@@ -1438,6 +1475,9 @@ class App:
         self._wake_done = False
         self._dark = False
         self.dark_plan = {}
+        self.remote_active = False
+        self._remote_main = None
+        self._remote_resized = False
         log.info("=== sleep ===")
         self.engine.set_context(asleep=True)
         if self.icon:
@@ -1467,6 +1507,12 @@ class App:
                 self.overlays.append(o)
             self.root.update()
         self.gate.start(self.wake)
+        if self.cfg.get("remote", {}).get("enabled", True):
+            try:
+                self.crd.start(on_connect=lambda: self.post(self._remote_connected),
+                               on_disconnect=lambda: self.post(self._remote_disconnected))
+            except Exception:
+                log.exception("crd watcher start")
         # Our own fingerprint session only when the desktop stays unlocked; on the
         # lock screen Windows Hello owns the sensor and the unlock itself wakes us.
         if not lock_now and self.cfg.get("fingerprint_wake", True) and self.fp.available():
@@ -1490,6 +1536,171 @@ class App:
         threading.Thread(target=self._asleep_loop, name="asleep-loop", daemon=True).start()
         log.info("asleep (locking=%s); saved %s", lock_now, self.saved)
 
+    def _darken_core(self, mons, exclude=frozenset()):
+        """Take each monitor dark: DDC/CI standby where the monitor implements it,
+        otherwise disconnect its video signal. Sets self.standby_targets and
+        self.detached; returns the plan dict. Monitors whose target is in
+        `exclude` are left on (the remote-desktop mode keeps the main one lit).
+        Does not dim or lock - the caller does that."""
+        plan = {"standby": [], "disconnected": [], "dimmed": []}
+        to_detach = {}
+        standby = set()
+        for m in mons:
+            tgt = (m.adapter[0], m.adapter[1], m.target) if m.adapter is not None else None
+            if tgt is not None and tgt in exclude:
+                continue
+            if self.cfg["ddc_standby"] and m.standby_capable():
+                m.power(False)
+                plan["standby"].append(m.name)
+                if tgt is not None:
+                    standby.add(tgt)
+            elif self.cfg.get("detach_no_standby", True) and self.topo is not None and tgt is not None:
+                to_detach[tgt] = m.name
+            else:
+                plan["dimmed"].append(m.name)
+        self.standby_targets = standby
+        if to_detach:
+            rc = topology.detach(self.topo, set(to_detach))
+            if rc == 0:
+                self.detached = set(to_detach)
+                plan["disconnected"] = list(to_detach.values())
+                log.info("disconnected to turn off (no DDC/CI standby): %s", plan["disconnected"])
+            else:
+                plan["dimmed"] += list(to_detach.values())
+                log.warning("could not disconnect %s (rc %s): left dimmed", list(to_detach.values()), rc)
+        return plan
+
+    # -- remote desktop (Chrome Remote Desktop) ------------------------------------
+    # When a CRD client connects while asleep, bring the main monitor up at 16:9
+    # for the session and leave the others off. Windows stays locked: the remote
+    # user signs in once through CRD (this never stores or types a password, never
+    # bypasses the lock). On disconnect, or a real keystroke at the desk ("switched
+    # to manual"), it locks and goes back to the dark sleep state.
+    def _remote_connected(self):
+        """A CRD client connected (runs on the UI thread). Hand the main monitor
+        to the session and stop treating the sign-in as a wake."""
+        if not self.asleep or self.remote_active:
+            return
+        if not self.cfg.get("remote", {}).get("enabled", True):
+            return
+        log.info("=== remote desktop connected ===")
+        self.remote_active = True
+        self.gate.stop()                 # the CRD sign-in must not fire the wake gate
+        if self.fp.active or self.fp._sess is not None:
+            threading.Thread(target=self.fp.stop, name="fp-stop", daemon=True).start()
+        self.engine.set_context(asleep=False)    # a remote session may game: let power scale
+        if self.cfg.get("remote", {}).get("lock_on_physical", True):
+            self.pkw.start(lambda why: self.post(self._remote_manual, why))
+        threading.Thread(target=self._remote_enter, name="remote-enter", daemon=True).start()
+
+    def _remote_disconnected(self):
+        """The CRD client went away: back to dark sleep, still locked."""
+        if not self.remote_active:
+            return
+        log.info("=== remote desktop disconnected ===")
+        self.remote_active = False
+        self.pkw.stop()
+        self.engine.set_context(asleep=True)
+        threading.Thread(target=self._remote_leave, args=("disconnected", False),
+                         name="remote-exit", daemon=True).start()
+
+    def _remote_manual(self, why):
+        """A real keystroke arrived at the desk during a remote session: lock at
+        once (a walk-up must never land in the remote user's session) and revert."""
+        if not self.remote_active:
+            return
+        log.info("=== remote: manual takeover (%s) -> lock ===", why)
+        self.remote_active = False
+        self.pkw.stop()
+        self.engine.set_context(asleep=True)
+        user32.LockWorkStation()
+        threading.Thread(target=self._remote_leave, args=("manual input", True),
+                         name="remote-manual", daemon=True).start()
+
+    def _remote_enter(self):
+        """Worker: make the desktop just the main monitor, at 16:9."""
+        with self._remote_lock:
+            try:
+                if not self.remote_active or not self.asleep:
+                    return
+                if self.topo is not None:
+                    topology.restore(self.topo)          # clean base: everything back
+                for m in self.monitors:
+                    m.close()
+                mons = mon.enumerate_monitors(probe_wmi=False, retries=2)
+                self.monitors = mons
+                main = next((m for m in mons if m.primary), mons[0] if mons else None)
+                if main is None or main.adapter is None:
+                    log.warning("remote: no main monitor to bring up")
+                    return
+                others = {(m.adapter[0], m.adapter[1], m.target) for m in mons
+                          if m is not main and m.adapter is not None}
+                if others and self.topo is not None:
+                    rc = topology.detach(self.topo, others)
+                    self.detached = set(others) if rc == 0 else set()
+                    log.info("remote: kept main %s, disconnected %d other(s) rc=%s",
+                             main.device, len(others), rc)
+                self.standby_targets = set()
+                self._remote_main = main.device
+                self._remote_resized = False
+                if self.cfg.get("remote", {}).get("wide_to_16x9", True):
+                    w = int(self.cfg["remote"].get("width") or 0)
+                    h = int(self.cfg["remote"].get("height") or 0)
+                    if not (w and h):
+                        best = mon.best_16x9_mode(main.device)
+                        if best:
+                            w, h = best
+                    if w and h and mon.set_resolution(main.device, w, h):
+                        self._remote_resized = True
+                        log.info("remote: main set to %dx%d (16:9)", w, h)
+                    else:
+                        log.info("remote: left main at native (no 16:9 mode applied)")
+                try:
+                    main.power(True)
+                except Exception:
+                    pass
+                self._dark = False
+                self._write_sentinel()
+                log.info("remote: desktop is the main monitor only; sign in via CRD")
+            except Exception:
+                log.exception("remote enter")
+
+    def _remote_leave(self, reason, locked_already):
+        """Worker: resolution back to native, every monitor dark again, locked."""
+        with self._remote_lock:
+            try:
+                log.info("remote: leaving (%s)", reason)
+                if self._remote_resized and self._remote_main:
+                    mon.reset_resolution(self._remote_main)
+                self._remote_resized = False
+                self._remote_main = None
+                if self.topo is not None:
+                    topology.restore(self.topo)
+                for m in self.monitors:
+                    m.close()
+                mons = mon.enumerate_monitors(probe_wmi=False, retries=2)
+                self.monitors = mons
+                self.detached = set()
+                self.standby_targets = set()
+                for m in mons:
+                    if self.cfg["dim_on_sleep"]:
+                        if m.ddc or m.wmi:
+                            m.set(m.min)
+                        if m.hdr:
+                            m.set_sdr_white_nits(mon.SDR_MIN_NITS)
+                self.dark_plan = self._darken_core(mons)
+                self._dark = True
+                self._write_sentinel()
+                self._notify_helper_asleep()
+                if not locked_already and (self.cfg.get("lock_on_sleep", True) or reason == "manual input"):
+                    if not user32.LockWorkStation():
+                        log.warning("remote leave: LockWorkStation failed %s", ctypes.get_last_error())
+            except Exception:
+                log.exception("remote leave")
+            finally:
+                if self.asleep and not self.remote_active:
+                    self.gate.start(self.wake)    # resume the normal two-tap / sign-in wake
+
     def _lights_off(self, mons, lock_now):
         """Worker: dim, take every monitor dark, then lock. DDC/CI standby where
         the monitor implements it; otherwise its video signal is cut (the way
@@ -1507,28 +1718,7 @@ class App:
             time.sleep(0.2)
             if self._wake_done:                  # woken already (an early key): leave the screens alone
                 return
-            to_detach = {}
-            standby = set()
-            for m in mons:
-                if self.cfg["ddc_standby"] and m.standby_capable():
-                    m.power(False)
-                    plan["standby"].append(m.name)
-                    if m.adapter is not None:
-                        standby.add((m.adapter[0], m.adapter[1], m.target))
-                elif self.cfg.get("detach_no_standby", True) and self.topo is not None and m.adapter is not None:
-                    to_detach[(m.adapter[0], m.adapter[1], m.target)] = m.name
-                else:
-                    plan["dimmed"].append(m.name)
-            self.standby_targets = standby
-            if to_detach:
-                rc = topology.detach(self.topo, set(to_detach))
-                if rc == 0:
-                    self.detached = set(to_detach)
-                    plan["disconnected"] = list(to_detach.values())
-                    log.info("disconnected to turn off (no DDC/CI standby): %s", plan["disconnected"])
-                else:
-                    plan["dimmed"] += list(to_detach.values())
-                    log.warning("could not disconnect %s (rc %s): left dimmed", list(to_detach.values()), rc)
+            plan = self._darken_core(mons)
         except Exception:
             log.exception("lights off")
         finally:
@@ -1614,6 +1804,22 @@ class App:
         self.last_wake_why = why
         self.asleep = False                      # new sleep requests are allowed from here on
         self.gate.stop()
+        try:
+            self.crd.stop()
+        except Exception:
+            pass
+        if self.remote_active:
+            self.remote_active = False
+            try:
+                self.pkw.stop()
+            except Exception:
+                pass
+            if self._remote_resized and self._remote_main:
+                try:
+                    mon.reset_resolution(self._remote_main)
+                except Exception:
+                    pass
+            self._remote_resized = False
         if self.fp.active or self.fp._sess is not None:
             threading.Thread(target=self.fp.stop, name="fp-stop", daemon=True).start()
         locked_now = bool(session_locked())

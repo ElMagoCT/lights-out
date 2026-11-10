@@ -243,3 +243,90 @@ class WakeGate:
                 if len(bursts) >= self.presses:
                     self._fire(f"{self.presses} input bursts on the lock screen")
                     return
+
+
+LLKHF_LOWER_IL_INJECTED = 0x02
+LLKHF_INJECTED = 0x10
+
+
+class PhysicalKeyWatcher:
+    """A pass-through low-level keyboard hook that fires on_physical when real
+    (non-injected) key presses arrive.
+
+    Used during a remote-desktop session to notice a person taking over at the
+    physical keyboard. Chrome Remote Desktop types with SendInput, which the
+    hook sees flagged as injected; a key pressed at the desk is not flagged, so
+    the remote user keeps typing without ever tripping this. Input is never
+    swallowed. Hooks are blind on the lock screen, so this only reports once the
+    desktop is unlocked - which is exactly when a walk-up at the desk matters.
+    """
+
+    def __init__(self, presses=2, window=3.0):
+        self.presses = presses
+        self.window = window
+        self._thread = None
+        self._tid = None
+        self._on = None
+        self._fired = False
+        self.active = False
+        self._down = set()
+        self._taps = []
+        self._kb = None
+
+    def start(self, on_physical):
+        self._on = on_physical
+        self._fired = False
+        self._down.clear()
+        self._taps.clear()
+        self.active = True
+        self._thread = threading.Thread(target=self._run, name="phys-key", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self.active = False
+        if self._tid:
+            user32.PostThreadMessageW(self._tid, WM_QUIT, 0, 0)
+        if self._thread:
+            self._thread.join(timeout=2)
+        self._thread = None
+        self._tid = None
+
+    def _proc(self, nCode, wParam, lParam):
+        if nCode == HC_ACTION and self.active:
+            k = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+            injected = bool(k.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED))
+            if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                if not injected and k.vkCode not in self._down:
+                    self._down.add(k.vkCode)
+                    self._tap()
+                elif injected:
+                    log.debug("remote keystroke ignored (injected)")
+            elif wParam in (WM_KEYUP, WM_SYSKEYUP):
+                self._down.discard(k.vkCode)
+        return user32.CallNextHookEx(None, nCode, wParam, lParam)   # never swallow
+
+    def _tap(self):
+        now = time.monotonic()
+        self._taps = [t for t in self._taps if now - t <= self.window] + [now]
+        if len(self._taps) >= self.presses and not self._fired:
+            self._fired = True
+            self.active = False
+            log.info("physical keyboard: %d presses within %.0fs", len(self._taps), self.window)
+            try:
+                self._on("physical keyboard")
+            except Exception:
+                log.exception("on_physical")
+
+    def _run(self):
+        self._tid = kernel32.GetCurrentThreadId()
+        self._kb = HOOKPROC(self._proc)
+        hmod = kernel32.GetModuleHandleW(None)
+        hk = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._kb, hmod, 0)
+        log.info("physical-key watch installed=%s", bool(hk))
+        msg = wt.MSG()
+        while self.active and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+        if hk:
+            user32.UnhookWindowsHookEx(hk)
+        log.info("physical-key watch removed")
