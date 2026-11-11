@@ -339,6 +339,15 @@ class Server(ThreadingHTTPServer):
         super().server_bind()
 
 
+def _answers():
+    try:
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:%d/ping" % PORT, timeout=1.5) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
 def main():
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)      # the error code must be read the safe way
     k32.CreateMutexW.restype = ctypes.wintypes.HANDLE
@@ -346,11 +355,19 @@ def main():
     mutex = k32.CreateMutexW(None, False, "Local\\LightsOutHelper")
     if ctypes.get_last_error() == 183:
         return
-    try:
-        srv = Server(("127.0.0.1", PORT), Handler)
-    except OSError as e:
-        log.warning("port %s is taken (%s): another helper owns it, exiting", PORT, e)
-        return
+    srv = None
+    for attempt in range(8):
+        try:
+            srv = Server(("127.0.0.1", PORT), Handler)
+            break
+        except OSError as e:
+            if _answers():                                    # a live helper owns the port: nothing to do
+                log.info("another helper is answering on port %s: exiting", PORT)
+                return
+            if attempt == 7:
+                log.warning("port %s stayed busy (%s): giving up", PORT, e)
+                return
+            time.sleep(4)                                     # the previous owner just died: let the port clear
     token = secrets.token_hex(24)                             # only the helper that won the port writes a token
     with open(TOKEN_PATH, "w", encoding="utf-8") as f:
         f.write(token)

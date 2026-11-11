@@ -34,6 +34,15 @@ when they turn off. The microphone can follow the same way. Device switching
 uses the same endpoint call the Sound control panel does; detection is a light
 poll of the audio endpoints, no driver or service.
 
+**Taskbar strip.** The everyday controls sit at the left end of the taskbar
+(empty on a centred Windows 11 taskbar): a Sleep button, one brightness slider
+for every monitor, a power-mode slider and live CPU / memory / GPU readings,
+with the AI agents' share when they are busy. Windows 11 has no API for putting
+controls inside the taskbar, so it is a borderless, never-activating window
+that keeps itself directly above the taskbar (the taskbar's own menus still
+draw over it), follows it when it moves, and hides with it: during sleep,
+auto-hide, or when a fullscreen app covers it.
+
 **Sleep.** Every monitor goes dark first and Windows locks after, so the
 lock screen is never drawn on a lit panel: brightness to 0, then DDC/CI
 standby where the monitor implements it. A monitor with no standby command
@@ -65,6 +74,14 @@ straight from the CRD host's own entries in the Windows event log; a keystroke
 is known to be local because Remote Desktop types with injected input, which the
 keyboard hook can tell from a key pressed at the desk.
 
+**Displays that are off stay off.** A monitor that is switched off in Settings
+when the desk goes to sleep is never turned on by waking, even if Windows
+brought it up in between. You can also keep the laptop's own screen off
+whenever another monitor is connected (never when it is the only one), and on
+a desk where no monitor can stay connected dark, that switched-off panel can
+hold the desktop while asleep so the real monitors can all turn off; waking
+switches it off again.
+
 **Safety net.** While asleep the tray app heartbeats to the helper. If it
 ever dies or hangs, the helper locks Windows, shows the taskbar, wakes the
 monitors and restores brightness within about ten seconds; a fresh start does
@@ -89,6 +106,22 @@ undone when the profile relaxes. **Max** is the overclock tier and only runs
 while temperatures are under the guard limits; above them it is dropped at
 once, and a CPU panic temperature means balanced plus full fans. Pick a
 profile by hand to pin it; the guard still applies.
+
+**Agent governor.** AI coding agents (several Claude Code sessions, each
+running builds, tests and scans) will take every core, and a browser - which
+runs its own tabs below normal priority - loses to them. The sessions are
+separate process trees that know nothing of each other, so the engine
+coordinates them from outside. Every process descended from an agent always
+runs below normal priority with low I/O and memory priority (free when the
+machine is idle, an instant yield when it is not). While you are using the PC
+and the agent app is not in front, the trees are also confined to a share of
+the logical CPUs (35 % kept free by default) and marked for efficiency under
+heavy load; when you are away, asleep, or looking at the agent itself, the
+ceiling comes off. Held-back agent work no longer counts when the engine picks
+a profile, so background agents cannot push the machine into the overclock
+tier. Measured with 16 extra CPU burners on top of running sessions: a
+normal-priority task outside the agent trees went from 18.2 s (machine at
+100 %) to 4.8 s (machine at 71 %).
 
 **Security assessment.** Defender, firewall, UAC, SmartScreen, Smart App
 Control, updates, autoruns, scheduled tasks, listening ports, local admins,
@@ -204,3 +237,20 @@ Stop the tray instance first; the self-test only opens its panel otherwise.
 - A remote client types with injected input (`LLKHF_INJECTED`); a key pressed at
   the desk is not flagged, which is the whole basis for telling a person taking
   over from the remote user's own typing.
+- A process started from inside a packaged (MSIX) app - a terminal or an agent
+  hosted by one - inherits its container: new files under `%LOCALAPPDATA%` land
+  in a private per-package copy, and the process dies when the host app closes.
+  An instance started that way and one started normally then disagree about
+  config, logs, the sleep state and the helper's token (HTTP 403 for ever). The
+  app now notices (a marker file materialises under `Packages\...\LocalCache`)
+  and restarts itself through Explorer; requests between instances use named
+  kernel events, which cross that boundary where files do not.
+- Declare ctypes prototypes. `SetWindowPos(hwnd, HWND_TOPMOST, ...)` through an
+  untyped prototype passes -1 as a 32-bit value: an invalid handle, a failed
+  call, no exception. The strip stayed on top only until the taskbar was first
+  clicked.
+- On Windows `SO_REUSEADDR` lets two processes listen on the same port.
+  `http.server` sets it; a second helper then answers with a token nobody
+  has. `SO_EXCLUSIVEADDRUSE` is the option that means what you expect.
+- A recorded parent PID is not proof of parenthood: PIDs are reused within
+  minutes. A parent link counts only if the parent was created first.
