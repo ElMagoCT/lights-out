@@ -72,6 +72,7 @@ class HelperClient:
         self.ok = False
         self.last_start_try = 0
         self.status = {}
+        self._warned = 0
 
     def _token(self):
         if not self.token:
@@ -102,7 +103,9 @@ class HelperClient:
                     tok = self._token()
                     if tok:
                         continue
-                log.warning("helper call %s failed: HTTP %s", path, e.code)
+                if time.time() - self._warned > 600:        # every 4 s otherwise: megabytes of log a day
+                    self._warned = time.time()
+                    log.warning("helper call %s failed: HTTP %s (not repeated for 10 min)", path, e.code)
                 self.ok = False
                 return None
             except Exception as e:

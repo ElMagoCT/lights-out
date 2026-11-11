@@ -21,6 +21,7 @@ import logging
 import logging.handlers
 import os
 import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -326,26 +327,48 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"error": "no such path"})
 
 
+class Server(ThreadingHTTPServer):
+    """Exactly one helper may own the port. http.server asks for SO_REUSEADDR,
+    and on Windows that lets a second process bind the same port: two helpers,
+    two tokens, and the app talking to the one whose token it does not have
+    (HTTP 403 for ever). SO_EXCLUSIVEADDRUSE makes the second bind fail."""
+    allow_reuse_address = False
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def main():
-    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\LightsOutHelper")
-    if ctypes.windll.kernel32.GetLastError() == 183:
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)      # the error code must be read the safe way
+    k32.CreateMutexW.restype = ctypes.wintypes.HANDLE
+    k32.ReleaseMutex.argtypes = [ctypes.wintypes.HANDLE]
+    mutex = k32.CreateMutexW(None, False, "Local\\LightsOutHelper")
+    if ctypes.get_last_error() == 183:
         return
-    token = secrets.token_hex(24)
+    try:
+        srv = Server(("127.0.0.1", PORT), Handler)
+    except OSError as e:
+        log.warning("port %s is taken (%s): another helper owns it, exiting", PORT, e)
+        return
+    token = secrets.token_hex(24)                             # only the helper that won the port writes a token
     with open(TOKEN_PATH, "w", encoding="utf-8") as f:
         f.write(token)
     Handler.hw = Hardware()
     Handler.token = token
     Handler.watchdog = Watchdog()
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     log.info("helper listening on 127.0.0.1:%s admin=%s asus=%s", PORT, is_admin(), Handler.hw.asus is not None)
     try:
         srv.serve_forever()
     finally:
         try:
-            os.remove(TOKEN_PATH)
+            with open(TOKEN_PATH, encoding="utf-8") as f:
+                mine = f.read().strip() == token
+            if mine:
+                os.remove(TOKEN_PATH)
         except OSError:
             pass
-        ctypes.windll.kernel32.ReleaseMutex(mutex)
+        k32.ReleaseMutex(mutex)
 
 
 if __name__ == "__main__":

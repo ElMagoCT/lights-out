@@ -38,6 +38,7 @@ CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 LOG_PATH = os.path.join(DATA_DIR, "lightsout.log")
 SIGNAL_PATH = os.path.join(DATA_DIR, ".open-panel")
 SLEEP_SIGNAL_PATH = os.path.join(DATA_DIR, ".sleep-now")   # drop this file to put the screens to sleep
+MUTEX_NAME = "Local\\LightsOutTray"
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
 GEO_PATH = os.path.join(DATA_DIR, "location.json")
 REPORT_DIR = os.path.join(DATA_DIR, "reports")
@@ -155,6 +156,7 @@ import topology                # noqa: E402
 import audio                   # noqa: E402
 import remote                  # noqa: E402
 import strip as taskbar_strip  # noqa: E402
+import breakout                # noqa: E402
 from gate import WakeGate, PhysicalKeyWatcher, session_locked  # noqa: E402
 
 user32 = ctypes.windll.user32
@@ -368,6 +370,12 @@ class App:
         self.audio.start()
         self.root.after(100, self._pump)
         self.root.after(500, self._poll_signal)
+        # the same two requests as named events: they reach us from anywhere (a second
+        # launch, --sleep, a process inside another app's container), with no polling
+        self.signals = breakout.SignalListener({
+            breakout.PANEL_EVENT: lambda: self.post(self.show_panel),
+            breakout.SLEEP_EVENT: lambda: self.post(self.sleep)})
+        self.signals.start()
         self.root.after(2500, self._audio_prefill)
         self.root.after(3000, self._sun_tick)
         self.root.after(30_000, self._context_tick)
@@ -1837,7 +1845,11 @@ class App:
         """Worker thread while asleep: proves the process is alive to the helper's
         watchdog and keeps the overlays (unlocked mode) on top, asking Tk for the
         latter without ever waiting on it."""
+        n = 0
         while self.asleep:
+            n += 1
+            if n % 30 == 0:
+                self._notify_helper_asleep()     # every minute: a restarted helper gets its watchdog back
             if time.monotonic() - self._hb < 10:
                 self._touch_heartbeat()          # only while the UI thread is pumping too
             if self.overlays:
@@ -2147,9 +2159,31 @@ def main():
         log.info("install: %s", lines)
         user32.MessageBoxW(None, "\n".join(lines), "Lights Out", 0x40)
         return
+    if "--sleep" in sys.argv or "--panel" in sys.argv:
+        # a request for the running instance, sent through a named event
+        name = breakout.SLEEP_EVENT if "--sleep" in sys.argv else breakout.PANEL_EVENT
+        log.info("signalled the running instance (%s): %s", name, breakout.signal(name))
+        return
+    if "--selftest" not in sys.argv and "--no-breakout" not in sys.argv:
+        private = breakout.private_view(DATA_DIR)
+        if private:
+            # Started from inside a packaged app's container: a private copy of the data
+            # folder, and a lifetime tied to that app. Hand over to a normal instance.
+            _trace(f"inside an app container (data redirected to {private})")
+            if breakout.mutex_exists(MUTEX_NAME):
+                breakout.signal(breakout.PANEL_EVENT)
+                log.info("in a container and an instance is already running: asked it to open the panel")
+                return
+            if breakout.relaunch_outside(os.path.abspath(__file__), FROZEN, ["--no-breakout"]) \
+                    and breakout.wait_for_mutex(MUTEX_NAME, 25):
+                _trace("relaunched outside the container; this copy exits")
+                log.info("relaunched outside the app container: this copy exits")
+                return
+            log.warning("could not relaunch outside the app container: running here on a private data folder (%s)", private)
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)      # the error code must be read the safe way
-    mutex = k32.CreateMutexW(None, False, "Local\\LightsOutTray")
+    mutex = k32.CreateMutexW(None, False, MUTEX_NAME)
     if ctypes.get_last_error() == 183:                          # ERROR_ALREADY_EXISTS: another instance is up
+        breakout.signal(breakout.PANEL_EVENT)
         open(SIGNAL_PATH, "w").close()
         log.info("another instance is running: asked it to open the panel")
         return
