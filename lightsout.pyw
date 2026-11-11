@@ -513,8 +513,7 @@ class App:
         self.root.after(90_000, self._security_tick)
         self.root.after(600_000, self._classify_tick)
         self._start_tray()
-        if self.cfg.get("taskbar_strip", {}).get("enabled", True):
-            self.root.after(1500, self.show_strip)
+        self.root.after(1500, self._strip_watchdog)
 
     @staticmethod
     def _load_json(path, default):
@@ -795,14 +794,31 @@ class App:
         threading.Thread(target=work, name="bright-all", daemon=True).start()
 
     def show_strip(self):
-        if self.strip is not None and self.strip.win.winfo_exists():
+        if getattr(self, "strip", None) is not None and self.strip.win.winfo_exists():
             return
+        log.info("show_strip: creating taskbar strip")
         try:
             self.strip = TaskbarStrip(self)
             log.info("taskbar strip shown")
         except Exception:
-            log.exception("taskbar strip")
+            log.exception("taskbar strip create failed")
             self.strip = None
+
+    def _strip_watchdog(self):
+        """Ensure the strip exists whenever it is enabled. The one-shot startup
+        schedule can be starved by a busy UI thread at launch (monitor
+        enumeration can stall it), so this re-creates the strip and heals it if
+        it ever dies. Runs every 5 s; a no-op once the strip is up."""
+        try:
+            want = self.cfg.get("taskbar_strip", {}).get("enabled", True)
+            alive = getattr(self, "strip", None) is not None and self.strip.win.winfo_exists()
+            if want and not alive:
+                self.show_strip()
+            elif not want and alive:
+                self.hide_strip()
+        except Exception:
+            log.exception("strip watchdog")
+        self.root.after(5000, self._strip_watchdog)
 
     def hide_strip(self):
         if self.strip is not None:
