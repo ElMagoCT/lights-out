@@ -6,7 +6,9 @@ Only the user's own processes can be changed without elevation, which is
 exactly the set we want (services and drivers are never touched)."""
 import ctypes
 import ctypes.wintypes as wt
+import json
 import logging
+import os
 
 import psutil
 
@@ -44,17 +46,71 @@ class _PPT(ctypes.Structure):
 
 
 def _set_eco(h, on):
-    s = _PPT(1, PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_EXECUTION_SPEED if on else 0)
+    # off = hand the decision back to Windows (ControlMask 0), not "never throttle this process"
+    flag = PROCESS_POWER_THROTTLING_EXECUTION_SPEED if on else 0
+    s = _PPT(1, flag, flag)
     return bool(k32.SetProcessInformation(h, ProcessPowerThrottling, ctypes.byref(s), ctypes.sizeof(s)))
 
 
 class Throttler:
-    def __init__(self, cfg_lists):
+    def __init__(self, cfg_lists, state_path=None):
         self.cfg = cfg_lists            # {"protected": [...], "hogs": [...], "never": [...]}
         self.applied = {}               # pid -> (name, original priority)
         self.level = "none"
+        self.state_path = state_path    # what is throttled right now, on disk: see recover()
+        self._created = {}              # pid -> process creation time (tells a reused pid apart)
+        self._saved = None
         self._users = {}                # pid -> username (token lookups are the expensive part of a scan)
         self.skip = set()               # pids the agent governor manages: hands off
+        self.recover()
+
+    def recover(self):
+        """Everything we slow down is put back when the profile relaxes or the app
+        quits - but not when the app is killed or crashes: the processes it had in
+        Efficiency mode at below-normal priority then stay that way until they exit
+        (found 98 of them on this machine, the browser included). So the list of what
+        is throttled lives in a small state file, and a new instance starts by
+        restoring whatever its predecessor left behind."""
+        if not self.state_path or not os.path.exists(self.state_path):
+            return 0
+        n = 0
+        try:
+            with open(self.state_path, encoding="utf-8") as f:
+                old = json.load(f)
+            for pid_s, (created, name, orig) in old.items():
+                pid = int(pid_s)
+                try:
+                    if abs(psutil.Process(pid).create_time() - created) > 1:
+                        continue                    # that pid is somebody else now
+                except Exception:
+                    continue
+                self.applied[pid] = (name, orig)
+                self._restore(pid)
+                n += 1
+            os.remove(self.state_path)
+        except Exception:
+            log.exception("throttle recovery")
+        if n:
+            log.info("restored %d processes a previous instance left throttled", n)
+        return n
+
+    def _save(self):
+        if not self.state_path:
+            return
+        cur = {str(pid): [self._created.get(pid, 0), name, orig] for pid, (name, orig) in self.applied.items()}
+        if cur == self._saved:
+            return
+        try:
+            if cur:
+                tmp = self.state_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(cur, f)
+                os.replace(tmp, self.state_path)
+            elif os.path.exists(self.state_path):
+                os.remove(self.state_path)
+            self._saved = cur
+        except OSError:
+            pass
 
     def _lists(self):
         prot = PROTECTED | {n.lower() for n in self.cfg.get("protected", [])}
@@ -98,6 +154,7 @@ class Throttler:
             if pid not in self.applied:
                 self._throttle(pid, name, level)
         self.level = level
+        self._save()
         return len(self.applied)
 
     def _throttle(self, pid, name, level):
@@ -111,11 +168,16 @@ class Throttler:
                 k32.SetPriorityClass(h, BELOW_NORMAL)
             if ok:
                 self.applied[pid] = (name, orig)
+                try:
+                    self._created[pid] = psutil.Process(pid).create_time()
+                except Exception:
+                    self._created[pid] = 0
         finally:
             k32.CloseHandle(h)
 
     def _restore(self, pid):
         name, orig = self.applied.pop(pid)
+        self._created.pop(pid, None)
         h = k32.OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION, False, pid)
         if not h:
             return
@@ -130,6 +192,7 @@ class Throttler:
         for pid in list(self.applied):
             self._restore(pid)
         self.level = "none"
+        self._save()
 
 
 if __name__ == "__main__":

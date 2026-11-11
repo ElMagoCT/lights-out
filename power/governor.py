@@ -134,7 +134,7 @@ class Governor:
         self.cfg = cfg
         self.kinds = {}             # pid -> (create, 'agent' | 'ui' | None): classification cache for candidate roots
         self.gov = {}               # pid -> {"create", "orig", "eco", "cap"}: descendants we have touched
-        self.root_cap = {}          # agent pid -> create, for agents whose affinity we confined
+        self.root_cap = {}          # agent pid -> (create, confined?) once its affinity has been set by us
         self.failed = {}            # pid -> create: could not open (elevated, gone): do not retry every pass
         self.prev = {}              # pid -> cpu time at the last pass
         self.prev_t = None
@@ -156,7 +156,8 @@ class Governor:
 
     @staticmethod
     def _eco(h, on):
-        s = _PPT(1, EXECUTION_SPEED, EXECUTION_SPEED if on else 0)
+        flag = EXECUTION_SPEED if on else 0             # off = Windows decides again
+        s = _PPT(1, flag, flag)
         return bool(k32.SetProcessInformation(h, ProcessPowerThrottling, ctypes.byref(s), ctypes.sizeof(s)))
 
     @staticmethod
@@ -260,10 +261,13 @@ class Governor:
                         k32.SetPriorityClass(h, BELOW_NORMAL)
                     self._hints(h, IO_LOW, PAGE_LOW)
                     st = self.gov[pid] = {"create": create, "orig": orig, "eco": False, "cap": False}
-                    if eco:
-                        st["eco"] = self._eco(h, True)
-                    if cap:
-                        st["cap"] = bool(k32.SetProcessAffinityMask(h, mask))
+                    # Set both, whatever we find: an instance that was killed while holding the
+                    # agents back left them confined and in Efficiency mode, and their children
+                    # inherited the confinement.
+                    if self._eco(h, eco):
+                        st["eco"] = eco
+                    if k32.SetProcessAffinityMask(h, mask):
+                        st["cap"] = cap
                 finally:
                     k32.CloseHandle(h)
                 continue
@@ -281,18 +285,17 @@ class Governor:
         # the agents themselves: confinement only, so their new children are born inside it
         for pid in roots:
             create = procs[pid][4]
-            have = self.root_cap.get(pid) == create
-            if cap != have:
+            seen = self.root_cap.get(pid)               # (create, confined?) - set on first sight too, see above
+            if seen is None or seen[0] != create or seen[1] != cap:
                 h = self._open(pid)
                 if h:
                     try:
                         if k32.SetProcessAffinityMask(h, mask):
-                            if cap:
-                                self.root_cap[pid] = create
-                            else:
-                                self.root_cap.pop(pid, None)
+                            self.root_cap[pid] = (create, cap)
                     finally:
                         k32.CloseHandle(h)
+                elif seen is None:
+                    self.root_cap[pid] = (create, cap)  # cannot open it: do not retry every pass
         # 6. forget what is gone
         for d in (self.gov, self.failed, self.root_cap, self.kinds):
             for pid in [p for p in d if p not in procs]:
@@ -332,8 +335,8 @@ class Governor:
         n = len(self.gov)
         for pid in list(self.gov):
             self._restore(pid, procs)
-        for pid, create in list(self.root_cap.items()):
-            if pid in procs and procs[pid][4] == create:
+        for pid, (create, confined) in list(self.root_cap.items()):
+            if confined and pid in procs and procs[pid][4] == create:
                 h = self._open(pid)
                 if h:
                     k32.SetProcessAffinityMask(h, self.sys_mask)

@@ -152,7 +152,7 @@ class Engine(threading.Thread):
         self.cfg = cfg                          # the "power" dict of the app config (live reference)
         self.on_change = on_change
         self.sens = S.Sensors(process_scan_every=5)      # per-process scan every 10 s
-        self.thr = T.Throttler(cfg.get("lists", {}))
+        self.thr = T.Throttler(cfg.get("lists", {}), os.path.join(data_dir, "throttled.json"))
         self.gov = G.Governor(cfg.setdefault("governor", dict(G.DEFAULTS)))   # AI agents' process trees
         self.plan = W.PlanTuner(os.path.join(data_dir, "plan_backup.json"))
         self.helper = HelperClient(cfg.get("helper_port", 5178), os.path.join(data_dir, "helper.token"))
