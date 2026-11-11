@@ -78,6 +78,7 @@ DEFAULTS = {
               "switch_mic": False, "mic_on_headphones_id": "", "mic_on_speakers_id": "", "poll_seconds": 3},
     "remote": {"enabled": True, "wide_to_16x9": True, "width": 0, "height": 0, "lock_on_physical": True},
     "taskbar_strip": {"enabled": True, "width": 660, "x_offset": 0},
+    "displays": {"keep_off": [], "keep_off_internal": False, "idle_surface_internal": True},
     "power": json.loads(json.dumps(E.DEFAULTS)),
     "claude": dict(CB.DEFAULTS),
     "security": {"weekly": True, "last_run": "", "last_summary": ""},
@@ -598,6 +599,7 @@ class App:
         except Exception:
             pass
         self._update_claude_load()
+        threading.Thread(target=self._enforce_displays, args=("periodic",), name="displays", daemon=True).start()
         self.root.after(30_000, self._context_tick)
 
     def _classify_tick(self):
@@ -1251,6 +1253,17 @@ class App:
         v["detach_no_standby"] = tk.BooleanVar(value=cfg.get("detach_no_standby", True))
         ttk.Checkbutton(f, text="A monitor with no DDC/CI standby command is disconnected while asleep (signal off, so its "
                                 "backlight turns off; reconnected on wake)", variable=v["detach_no_standby"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        dsp = cfg.get("displays", {})
+        v["d_keep_int"] = tk.BooleanVar(value=dsp.get("keep_off_internal", False))
+        v["d_idle_int"] = tk.BooleanVar(value=dsp.get("idle_surface_internal", True))
+        v["d_keep"] = tk.StringVar(value=", ".join(dsp.get("keep_off", [])))
+        ttk.Checkbutton(f, text="Keep the laptop's own screen off whenever another monitor is connected",
+                        variable=v["d_keep_int"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        ttk.Checkbutton(f, text="...but let it be the dark idle screen while asleep when no monitor can stay connected dark",
+                        variable=v["d_idle_int"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        r = row(f, r, "Other displays to keep off (names, comma-separated)", ttk.Entry(f, textvariable=v["d_keep"], width=30))
+        ttk.Label(f, text="A display that is switched off when the desk goes to sleep is never turned on by waking.",
+                  style="Dim.TLabel").grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
         ttk.Label(f, text="Hotkeys  (e.g. ctrl+alt+s, ctrl+shift+f9, win+pause)", style="Section.TLabel").grid(row=r, column=0, columnspan=2, sticky="w", pady=(14, 2)); r += 1
         v["hotkeys"] = {}
         for key, label in (("sleep", "Sleep now"), ("panel", "Open panel"), ("brightness_up", "Brightness up"), ("brightness_down", "Brightness down")):
@@ -1489,6 +1502,9 @@ class App:
             cfg["fingerprint_unlocks"] = bool(v["fingerprint_unlocks"].get())
             cfg["lock_on_sleep"] = bool(v["lock_on_sleep"].get()); cfg["relock_minutes"] = max(0, int(v["relock_minutes"].get()))
             cfg["detach_no_standby"] = bool(v["detach_no_standby"].get())
+            cfg.setdefault("displays", {}).update(
+                keep_off_internal=bool(v["d_keep_int"].get()), idle_surface_internal=bool(v["d_idle_int"].get()),
+                keep_off=[x.strip() for x in v["d_keep"].get().split(",") if x.strip()])
             cfg["brightness_step"] = max(1, int(v["brightness_step"].get()))
             cfg["hotkeys"] = {k: var.get().strip() for k, var in v["hotkeys"].items()}
             pw = cfg["power"]
@@ -1614,6 +1630,10 @@ class App:
                 entry["sdr_nits"] = m.sdr_white_nits()
             self.saved[m.device] = entry
         self.topo = topology.snapshot()          # the layout to put back if a monitor gets disconnected
+        try:
+            self.off_names = topology.off_names()    # displays the user has switched off: waking must not turn them on
+        except Exception:
+            self.off_names = []
         self.detached = set()
         self.standby_targets = set()
         self._touch_heartbeat()
@@ -1646,6 +1666,8 @@ class App:
             else:
                 plan["dimmed"].append(m.name)
         self.standby_targets = standby
+        if to_detach and not standby and not plan["dimmed"] and not exclude and self._idle_surface(to_detach, plan):
+            return plan
         if to_detach:
             rc = topology.detach(self.topo, set(to_detach))
             if rc == 0:
@@ -1656,6 +1678,52 @@ class App:
                 plan["dimmed"] += list(to_detach.values())
                 log.warning("could not disconnect %s (rc %s): left dimmed", list(to_detach.values()), rc)
         return plan
+
+    def _idle_surface(self, to_detach, plan):
+        """Every monitor on the desktop has to lose its signal to go dark, and
+        Windows will not disconnect the last one. If the laptop's own panel is
+        connected but switched off, let it hold the desktop instead (dimmed as
+        far as it goes) so the real monitors can all turn off; waking puts the
+        saved layout back, which switches it off again. True if that was done."""
+        d = self.cfg.get("displays", {})
+        if not d.get("idle_surface_internal", True):
+            return False
+        try:
+            if not any(c["internal"] and not c["active"] for c in topology.connected()):
+                return False
+            rc = topology.internal_only()
+            if rc:
+                log.warning("idle surface: could not switch to the internal panel (rc %s)", rc)
+                return False
+            self.detached = set(to_detach)
+            plan["disconnected"] = list(to_detach.values())
+            plan["idle_surface"] = "internal panel"
+            for m in mon.enumerate_monitors(probe_wmi=True, retries=1):
+                if m.ddc or m.wmi:
+                    m.set(m.min)
+                m.close()
+            log.info("no monitor can stay connected dark: the internal panel holds the desktop; disconnected %s", plan["disconnected"])
+            return True
+        except Exception:
+            log.exception("idle surface")
+            return False
+
+    def _enforce_displays(self, why, use_sleep_record=False):
+        """Switch off again any display that should not be on: one the user had
+        off when the desk went to sleep (after a wake), one on the keep-off list,
+        or the laptop's own panel when that is to stay off."""
+        if self.asleep or self.remote_active:
+            return
+        d = self.cfg.get("displays", {})
+        off = list(getattr(self, "off_names", [])) if use_sleep_record else []
+        if not (off or d.get("keep_off") or d.get("keep_off_internal")):
+            return
+        try:
+            names = topology.enforce_off(off, d.get("keep_off", []), d.get("keep_off_internal", False))
+            if names:
+                log.info("displays kept off (%s): %s", why, names)
+        except Exception:
+            log.exception("enforce displays")
 
     # -- remote desktop (Chrome Remote Desktop) ------------------------------------
     # When a CRD client connects while asleep, bring the main monitor up at 16:9
@@ -1838,7 +1906,7 @@ class App:
         were parked in DDC/CI standby so they can be signal-cycled awake."""
         return {"pid": os.getpid(), "heartbeat": HEARTBEAT_PATH, "saved": self.saved,
                 "topology": self.topo.to_json() if self.topo else None,
-                "standby": [list(t) for t in self.standby_targets]}
+                "standby": [list(t) for t in self.standby_targets], "off": list(getattr(self, "off_names", []))}
 
     def _write_sentinel(self):
         try:
@@ -1973,6 +2041,7 @@ class App:
             self.standby_targets = set()
             for m in mons:
                 m.close()
+            self._enforce_displays("after wake", use_sleep_record=True)
             mons = mon.enumerate_monitors(probe_wmi=False)   # fresh handles after the layout change
         for m in mons:
             try:
