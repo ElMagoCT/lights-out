@@ -238,7 +238,9 @@ class Governor:
         eco = cap and self.eco_on
         mask = cap_mask(self.sys_mask, self._reserve()) if cap else self.sys_mask
         if cap != self.capping:
-            log.info("agents %s: %d processes under %d sessions, %.0f%% CPU%s", "held back" if cap else "released",
+            # every time you step away and come back: only worth the log when they are busy
+            (log.info if self.cpu >= 5 else log.debug)(
+                "agents %s: %d processes under %d sessions, %.0f%% CPU%s", "held back" if cap else "released",
                      len(governed), len(roots), self.cpu,
                      (" (confined to %d of %d logical CPUs)" % (bin(mask).count("1"), self.ncpu)) if cap else "")
             self.capping = cap

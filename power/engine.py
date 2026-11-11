@@ -52,7 +52,7 @@ DEFAULTS = {
                    "solidworks", "capcut.exe", "obs64.exe"],
     "light_apps": [],
     "lists": {"protected": [], "hogs": []},
-    "thermal": {"cpu_max": 92, "cpu_panic": 97, "gpu_max": 86, "hysteresis": 6, "hold_s": 60},
+    "thermal": {"cpu_max": 92, "cpu_panic": 97, "gpu_max": 86, "hysteresis": 6, "hold_s": 60, "hold_max_s": 1800},
     "boost": {"ppt_total_w": 80, "ppt_apu_w": 65,
               "fan_temps": [20, 45, 55, 62, 68, 74, 80, 88], "fan_speeds": [10, 30, 45, 60, 75, 90, 100, 100]},
     "ryzenadj": {"path": "", "performance": "", "max": "--tctl-temp=95", "quiet": "", "balanced": ""},
@@ -165,6 +165,8 @@ class Engine(threading.Thread):
         self.thermal_cap = None                 # profile ceiling imposed by temperature
         self.thermal_until = 0
         self.thermal_note = ""
+        self.trips = collections.deque()       # times the thermal guard tripped in the last hour
+        self._fans_at = 0
         self.state = {}
         self._halt = threading.Event()
         self._lock = threading.Lock()
@@ -283,17 +285,33 @@ class Engine(threading.Thread):
         return "balanced", f"normal use ({cpu30:.0f}% CPU / {gpu30:.0f}% GPU)"
 
     def thermal_guard(self, s, want, why):
+        """Cap the profile while the CPU or GPU is too hot. Each new trip within
+        the hour holds the cap three times longer (60 s, 3 min, 9 min, 27 min,
+        then 30 min): with Max pinned on a machine that cannot sustain it, the
+        old fixed 60 s hold re-armed Max every few minutes, straight back into a
+        97 °C panic with the fans at full - six times in one morning here."""
         t = self.cfg["thermal"]
         cpu, gpu = s.get("cpu_temp") or 0, s.get("gpu_temp") or 0
         now = time.time()
+        level = note = None
         if cpu >= t["cpu_panic"]:
-            self.thermal_cap, self.thermal_until = "balanced", now + t["hold_s"]
-            self.thermal_note = f"CPU {cpu}°C: panic, cooling down"
-            self.helper.call("/fans", {"full": True})
+            level, note = "balanced", f"CPU {cpu}°C: panic, cooling down"
         elif cpu >= t["cpu_max"] or gpu >= t["gpu_max"]:
-            if self.thermal_cap != "balanced" or now >= self.thermal_until:
-                self.thermal_cap, self.thermal_until = "performance", now + t["hold_s"]
-                self.thermal_note = f"{'CPU' if cpu >= t['cpu_max'] else 'GPU'} {max(cpu, gpu)}°C: no overclock"
+            level, note = "performance", f"{'CPU' if cpu >= t['cpu_max'] else 'GPU'} {max(cpu, gpu)}°C: no overclock"
+        if level is not None:
+            if self.thermal_cap is None or PROFILES.index(level) < PROFILES.index(self.thermal_cap):
+                while self.trips and now - self.trips[0] > 3600:
+                    self.trips.popleft()
+                self.trips.append(now)
+                hold = min(float(t.get("hold_max_s", 1800)), float(t["hold_s"]) * 3 ** (len(self.trips) - 1))
+                self.thermal_cap, self.thermal_until, self.thermal_note = level, now + hold, note
+                log.info("thermal: %s -> at most %s for %.0f s (trip %d this hour)", note, level, hold, len(self.trips))
+            elif level == self.thermal_cap:
+                self.thermal_until = max(self.thermal_until, now + float(t["hold_s"]))   # still hot: keep holding
+                self.thermal_note = note
+            if level == "balanced" and now - self._fans_at > 150:
+                self._fans_at = now
+                self.helper.call("/fans", {"full": True})   # the helper's full-fan spell lasts 3 min
         elif self.thermal_cap and now >= self.thermal_until and \
                 cpu < t["cpu_max"] - t["hysteresis"] and gpu < t["gpu_max"] - t["hysteresis"]:
             self.thermal_cap, self.thermal_note = None, ""
