@@ -54,6 +54,7 @@ class Throttler:
         self.applied = {}               # pid -> (name, original priority)
         self.level = "none"
         self._users = {}                # pid -> username (token lookups are the expensive part of a scan)
+        self.skip = set()               # pids the agent governor manages: hands off
 
     def _lists(self):
         prot = PROTECTED | {n.lower() for n in self.cfg.get("protected", [])}
@@ -72,7 +73,7 @@ class Throttler:
                 name = (p.info["name"] or "").lower()
                 pid = p.info["pid"]
                 seen.add(pid)
-                if pid == fg_pid or name == fg_name or name in prot:
+                if pid == fg_pid or name == fg_name or name in prot or pid in self.skip:
                     continue
                 if level != "all" and name not in hogs:
                     continue

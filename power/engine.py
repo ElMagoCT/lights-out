@@ -27,6 +27,7 @@ import time
 import urllib.error
 import urllib.request
 
+from . import governor as G
 from . import sensors as S
 from . import throttle as T
 from . import windows_power as W
@@ -57,6 +58,7 @@ DEFAULTS = {
     "ryzenadj": {"path": "", "performance": "", "max": "--tctl-temp=95", "quiet": "", "balanced": ""},
     "afterburner": {"path": r"C:\Program Files (x86)\MSI Afterburner\MSIAfterburner.exe", "oc_profile": 0, "stock_profile": 0},
     "helper_port": 5178,
+    "governor": dict(G.DEFAULTS),
 }
 
 
@@ -151,6 +153,7 @@ class Engine(threading.Thread):
         self.on_change = on_change
         self.sens = S.Sensors(process_scan_every=5)      # per-process scan every 10 s
         self.thr = T.Throttler(cfg.get("lists", {}))
+        self.gov = G.Governor(cfg.setdefault("governor", dict(G.DEFAULTS)))   # AI agents' process trees
         self.plan = W.PlanTuner(os.path.join(data_dir, "plan_backup.json"))
         self.helper = HelperClient(cfg.get("helper_port", 5178), os.path.join(data_dir, "helper.token"))
         self.hist = collections.deque(maxlen=60)
@@ -196,6 +199,7 @@ class Engine(threading.Thread):
 
     def shutdown(self):
         try:
+            self.gov.release_all()
             self.thr.release_all()
             self.plan.restore()
             if self._oc_on:
@@ -207,6 +211,14 @@ class Engine(threading.Thread):
 
     def tick(self, n):
         s = self.sens.sample()
+        try:
+            s.update(self.gov.tick(s, asleep=self.asleep, locked=self.locked))
+            self.thr.skip = self.gov.pids()
+        except Exception:
+            log.exception("governor")
+        # Work the agents do in the background while they are being held back must not
+        # push the power profile up: decide on what is left once their share is taken out.
+        s["cpu_user"] = max(0.0, s["cpu"] - (s.get("agent_cpu") or 0)) if s.get("agent_cap") else s["cpu"]
         if n % 2 == 0:
             self.helper.ensure_running()
             st = self.helper.call("/status") or {}
@@ -240,8 +252,8 @@ class Engine(threading.Thread):
 
     def decide(self, s):
         c = self.cfg
-        cpu30, gpu30 = self._avg("cpu", 30), self._avg("gpu_util", 30)
-        cpu10, gpu10 = self._avg("cpu", 10), self._avg("gpu_util", 10)
+        cpu30, gpu30 = self._avg("cpu_user", 30), self._avg("gpu_util", 30)
+        cpu10, gpu10 = self._avg("cpu_user", 10), self._avg("gpu_util", 10)
         fg = s.get("fg") or ""
         heavy_fg = any(h and h.lower() in fg for h in c.get("heavy_apps", []))
         light_fg = any(l and l.lower() in fg for l in c.get("light_apps", []))
@@ -359,6 +371,8 @@ class Engine(threading.Thread):
             self.state.update({
                 "profile": self.profile, "reason": self.reason, "mode": self.cfg.get("mode", "auto"),
                 "cpu": s.get("cpu"), "mem": s.get("mem"), "gpu_util": s.get("gpu_util"),
+                "agent_n": s.get("agent_n"), "agent_cpu": s.get("agent_cpu"),
+                "agent_cap": s.get("agent_cap"), "agent_eco": s.get("agent_eco"),
                 "cpu_temp": s.get("cpu_temp"), "gpu_temp": s.get("gpu_temp"), "fans": s.get("fans"),
                 "fg": s.get("fg"), "idle_s": s.get("idle_s"), "on_ac": s.get("on_ac"), "battery": s.get("battery"),
                 "pressure": round(max(self._avg("cpu", 30), self._avg("gpu_util", 30))),

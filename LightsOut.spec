@@ -8,7 +8,7 @@ block_cipher = None
 HERE = os.path.abspath(".")
 ICON = os.path.join(HERE, "lightsout.ico")
 hidden = ["pystray._win32", "PIL.Image", "PIL.ImageDraw", "win32com.client", "pythoncom", "pywintypes",
-          "psutil", "power.engine", "power.sensors", "power.throttle", "power.windows_power", "power.nvml",
+          "psutil", "power.engine", "power.governor", "power.sensors", "power.throttle", "power.windows_power", "power.nvml",
           "power.asus_acpi", "monitors", "topology", "audio", "remote", "strip", "breakout", "gate", "sun", "security", "claude_bridge", "install",
           "comtypes", "comtypes.client", "comtypes.stream"]
 

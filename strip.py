@@ -205,7 +205,7 @@ class TaskbarStrip:
         tray = self._tray()
         r = wt.RECT()
         if tray and u32.GetWindowRect(tray, ctypes.byref(r)):
-            geom = "%dx%d+%d+%d" % (int(self.cfg.get("width", 660)), r.bottom - r.top,
+            geom = "%dx%d+%d+%d" % (max(int(self.cfg.get("width", 660)), self.win.winfo_reqwidth()), r.bottom - r.top,
                                     r.left + int(self.cfg.get("x_offset", 0)), r.top)
             if geom != self._geom:
                 self.win.geometry(geom)
@@ -273,6 +273,8 @@ class TaskbarStrip:
                     bits.append(f"RAM{st['mem']:>3.0f}%")
                 if st.get("gpu_util") is not None:
                     bits.append(f"GPU{st['gpu_util']:>3.0f}%")
+                if st.get("agent_n") and (st.get("agent_cpu") or 0) >= 2:       # AI agents' share; the arrow = held back
+                    bits.append(f"AI{st['agent_cpu']:>3.0f}%" + ("↓" if st.get("agent_cap") else ""))
                 if st.get("thermal"):
                     bits.append("⚠")
                 self.stats.config(text="  ".join(bits))

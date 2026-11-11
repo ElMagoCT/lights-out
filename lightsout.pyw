@@ -1089,6 +1089,9 @@ class App:
             bits.append(f"battery {st['battery']:.0f}%")
         if st.get("thermal"):
             bits.append("⚠ " + st["thermal"])
+        if st.get("agent_n"):
+            held = (" · held back" + (" (eco)" if st.get("agent_eco") else "")) if st.get("agent_cap") else ""
+            bits.append(f"AI agents {st['agent_n']} procs {st.get('agent_cpu') or 0:.0f}%{held}")
         if not st.get("helper"):
             bits.append("helper not running")
         self.sensor_line.config(text=" · ".join(bits))
@@ -1266,6 +1269,11 @@ class App:
         ttk.Checkbutton(f, text="Engine on (auto-pick quiet / balanced / performance / max)", variable=v["p_enabled"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
         ttk.Checkbutton(f, text="Slow background apps (Efficiency mode) while something heavy is in front", variable=v["p_throttle"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
         ttk.Checkbutton(f, text="Allow Max (overclock tier: raised power limits, aggressive fans, GPU OC profile)", variable=v["p_allow_max"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        gv = pw.get("governor", {})
+        v["g_enabled"] = tk.BooleanVar(value=gv.get("enabled", True)); v["g_reserve"] = tk.IntVar(value=int(gv.get("reserve_pct", 35)))
+        ttk.Checkbutton(f, text="Hold AI coding agents (Claude Code) back while I am using the PC, so they cannot starve the app in front",
+                        variable=v["g_enabled"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        r = row(f, r, "...share of the CPU kept free of agent work (%)", ttk.Spinbox(f, from_=15, to=75, width=5, textvariable=v["g_reserve"]))
         v["p_idle"] = tk.IntVar(value=pw.get("idle_minutes", 5)); v["p_load_high"] = tk.IntVar(value=pw.get("load_high", 55)); v["p_max_load"] = tk.IntVar(value=pw.get("max_load", 85))
         r = row(f, r, "Quiet after idle (minutes)", ttk.Spinbox(f, from_=1, to=120, width=5, textvariable=v["p_idle"]))
         r = row(f, r, "Performance above CPU/GPU load (%)", ttk.Spinbox(f, from_=20, to=95, width=5, textvariable=v["p_load_high"]))
@@ -1485,6 +1493,7 @@ class App:
             cfg["hotkeys"] = {k: var.get().strip() for k, var in v["hotkeys"].items()}
             pw = cfg["power"]
             pw["enabled"] = bool(v["p_enabled"].get()); pw["throttle_background"] = bool(v["p_throttle"].get()); pw["allow_max"] = bool(v["p_allow_max"].get())
+            pw.setdefault("governor", {}).update(enabled=bool(v["g_enabled"].get()), reserve_pct=max(15, min(75, int(v["g_reserve"].get()))))
             pw["idle_minutes"] = int(v["p_idle"].get()); pw["load_high"] = int(v["p_load_high"].get()); pw["max_load"] = int(v["p_max_load"].get())
             pw.setdefault("thermal", {}).update(cpu_max=int(v["t_cpu_max"].get()), cpu_panic=int(v["t_cpu_panic"].get()), gpu_max=int(v["t_gpu_max"].get()))
             pw.setdefault("boost", {}).update(ppt_total_w=int(v["b_total"].get()), ppt_apu_w=int(v["b_apu"].get()))

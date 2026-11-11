@@ -23,6 +23,10 @@ _buf = ctypes.create_string_buffer(1 << 20)
 
 def snapshot():
     """[(pid, name_lower, cpu_100ns, rss_bytes, ppid, session)] for every process."""
+    return _walk(False)
+
+
+def _walk(with_create):
     global _buf
     needed = wt.ULONG(0)
     while True:
@@ -46,11 +50,25 @@ def snapshot():
         session = struct.unpack_from("<I", raw, off + _OFF_SESSION)[0]
         ws = struct.unpack_from("<Q", raw, off + _OFF_WS)[0]
         name = ctypes.wstring_at(nptr, nlen // 2).lower() if nptr and nlen else ("system" if pid == 4 else "idle" if pid == 0 else "?")
-        out.append((pid, name, user + kern, ws, ppid, session))
+        if with_create:
+            out.append((pid, name, user + kern, ws, ppid, session, struct.unpack_from("<q", raw, off + _OFF_CREATE)[0]))
+        else:
+            out.append((pid, name, user + kern, ws, ppid, session))
         if not nxt:
             break
         off += nxt
     return out
+
+
+_OFF_CREATE = 32
+
+
+def snapshot_tree():
+    """[(pid, name_lower, cpu_100ns, ppid, create_100ns)] for every process: what
+    is needed to walk the process tree safely. A recorded parent PID may by now
+    belong to an unrelated, younger process (PIDs are reused within minutes), so
+    a parent link only counts if the parent was created before the child."""
+    return [(pid, name, cpu, ppid, create) for pid, name, cpu, ws, ppid, sess, create in _walk(True)]
 
 
 class CpuTracker:
