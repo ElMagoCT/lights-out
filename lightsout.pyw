@@ -76,6 +76,7 @@ DEFAULTS = {
     "audio": {"show_in_panel": True, "auto_switch": True, "headphone_id": "", "speaker_id": "",
               "switch_mic": False, "mic_on_headphones_id": "", "mic_on_speakers_id": "", "poll_seconds": 3},
     "remote": {"enabled": True, "wide_to_16x9": True, "width": 0, "height": 0, "lock_on_physical": True},
+    "taskbar_strip": {"enabled": True, "width": 660, "x_offset": 0},
     "power": json.loads(json.dumps(E.DEFAULTS)),
     "claude": dict(CB.DEFAULTS),
     "security": {"weekly": True, "last_run": "", "last_summary": ""},
@@ -313,6 +314,146 @@ def taskbar_windows():
     return out
 
 
+class TaskbarStrip:
+    """A thin always-on-top control bar docked over the left end of the taskbar:
+    sleep button, one brightness slider for every monitor, a power-mode slider
+    and live stats. Windows 11 has no API to put controls inside the taskbar, so
+    this is a borderless, no-activate tool window kept at the taskbar's left edge
+    (empty on a centred taskbar) and held just above it. Lightweight: it reuses
+    the engine's 2 s snapshot and writes brightness only when a drag ends."""
+
+    _MODES = ["auto", "quiet", "balanced", "performance", "max"]
+    GA_ROOT = 2
+    GWL_EXSTYLE = -20
+    WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE = 0x80, 0x08000000
+    HWND_TOPMOST = -1
+    SWP = 0x1 | 0x2 | 0x10        # NOSIZE | NOMOVE | NOACTIVATE
+
+    def __init__(self, app):
+        self.app = app
+        self.cfg = app.cfg.get("taskbar_strip", {})
+        self._hwnd = None
+        self._last_geom = None
+        self.win = tk.Toplevel(app.root, bg=BG)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self._build()
+        vals = [v for v in app.last.values() if isinstance(v, (int, float))]
+        if vals:
+            iv = int(sum(vals) / len(vals))
+            self.bright.set(iv)
+            self.bright_lab.config(text=f"{iv}%")
+        self.win.update_idletasks()
+        self._style_window()
+        self._reposition()
+        self._tick()
+
+    def _build(self):
+        f = tk.Frame(self.win, bg=BG)
+        f.pack(fill="both", expand=True, padx=8, pady=5)
+        self.sleep_btn = tk.Button(f, text="☾ Sleep", bg=PANEL, fg=FG, bd=0, relief="flat",
+                                   font=("Segoe UI", 9, "bold"), activebackground=ACCENT,
+                                   activeforeground="#101114", cursor="hand2",
+                                   command=lambda: self.app.post(self.app.sleep))
+        self.sleep_btn.pack(side="left", padx=(0, 10), ipadx=6, ipady=2)
+        tk.Label(f, text="☀", bg=BG, fg=DIM, font=("Segoe UI", 11)).pack(side="left")
+        self.bright = tk.DoubleVar(value=50)
+        self.bright_scale = ttk.Scale(f, from_=0, to=100, variable=self.bright, length=110,
+                                      command=self._on_bright)
+        self.bright_scale.pack(side="left", padx=(3, 3))
+        self.bright_scale.bind("<ButtonRelease-1>", self._commit_bright)
+        self.bright_lab = tk.Label(f, text="--%", bg=BG, fg=FG, width=4, font=("Segoe UI", 9))
+        self.bright_lab.pack(side="left", padx=(0, 10))
+        tk.Label(f, text="⚡", bg=BG, fg=DIM, font=("Segoe UI", 11)).pack(side="left")
+        self.power = tk.DoubleVar(value=0)
+        self.power_scale = ttk.Scale(f, from_=0, to=4, variable=self.power, length=96,
+                                     command=self._on_power)
+        self.power_scale.pack(side="left", padx=(3, 3))
+        self.power_scale.bind("<ButtonRelease-1>", self._commit_power)
+        self.power_lab = tk.Label(f, text="Auto", bg=BG, fg=FG, width=10, anchor="w", font=("Segoe UI", 9))
+        self.power_lab.pack(side="left", padx=(0, 10))
+        self.stats = tk.Label(f, text="", bg=BG, fg="#9aa0ad", anchor="w", font=("Consolas", 9))
+        self.stats.pack(side="left", fill="x", expand=True)
+
+    # -- brightness (write only on release; label tracks the drag) --------------
+    def _on_bright(self, _=None):
+        self.bright_lab.config(text=f"{int(float(self.bright.get()))}%")
+
+    def _commit_bright(self, _=None):
+        v = int(float(self.bright.get()))
+        self.app.post(lambda: self.app.set_brightness_all(v))
+
+    # -- power mode (snap to a detent; apply on release) ------------------------
+    def _on_power(self, _=None):
+        i = max(0, min(4, int(round(float(self.power.get())))))
+        self.power_lab.config(text=self._MODES[i].capitalize())
+
+    def _commit_power(self, _=None):
+        i = max(0, min(4, int(round(float(self.power.get())))))
+        self.power.set(i)
+        self.app.post(lambda m=self._MODES[i]: self.app.set_power_mode(m))
+
+    # -- window placement -------------------------------------------------------
+    def _style_window(self):
+        try:
+            self._hwnd = user32.GetAncestor(self.win.winfo_id(), self.GA_ROOT)
+            ex = user32.GetWindowLongW(self._hwnd, self.GWL_EXSTYLE)
+            user32.SetWindowLongW(self._hwnd, self.GWL_EXSTYLE,
+                                  ex | self.WS_EX_TOOLWINDOW | self.WS_EX_NOACTIVATE)
+            user32.SetWindowPos(self._hwnd, self.HWND_TOPMOST, 0, 0, 0, 0, self.SWP)
+        except Exception:
+            log.exception("strip style")
+
+    def _reposition(self):
+        tray = user32.FindWindowW("Shell_TrayWnd", None)
+        r = wt.RECT()
+        if tray and user32.GetWindowRect(tray, ctypes.byref(r)):
+            h = r.bottom - r.top
+            w = int(self.cfg.get("width", 520))
+            x = r.left + int(self.cfg.get("x_offset", 0))
+            geom = f"{w}x{h}+{x}+{r.top}"
+            if geom != self._last_geom:
+                self.win.geometry(geom)
+                self._last_geom = geom
+
+    def _tick(self):
+        if not self.win.winfo_exists():
+            return
+        self._reposition()
+        if self._hwnd:
+            try:
+                user32.SetWindowPos(self._hwnd, self.HWND_TOPMOST, 0, 0, 0, 0, self.SWP)
+            except Exception:
+                pass
+        try:
+            st = self.app.engine.snapshot()
+            mode = self.app.cfg["power"].get("mode", "auto")
+            i = self._MODES.index(mode) if mode in self._MODES else 0
+            if int(round(float(self.power.get()))) != i:
+                self.power.set(i)
+            prof = (st.get("profile") or "-")
+            self.power_lab.config(text=(f"Auto·{prof[:4]}" if mode == "auto" else mode.capitalize()))
+            bits = []
+            if st.get("cpu") is not None:
+                bits.append(f"CPU{st['cpu']:>3.0f}%" + (f" {st['cpu_temp']:>2.0f}°" if st.get("cpu_temp") else ""))
+            if st.get("mem") is not None:
+                bits.append(f"RAM{st['mem']:>3.0f}%")
+            if st.get("gpu_util") is not None:
+                bits.append(f"GPU{st['gpu_util']:>3.0f}%")
+            if st.get("thermal"):
+                bits.append("⚠")
+            self.stats.config(text="  ".join(bits))
+        except Exception:
+            pass
+        self.win.after(2000, self._tick)
+
+    def destroy(self):
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
 class App:
     def __init__(self, selftest=False):
         self.cfg = load_config()
@@ -355,6 +496,7 @@ class App:
         self._audio_dragging = False
         self._audio_sig = None            # last device set drawn in the panel, to avoid needless rebuilds
         self.security_busy = False
+        self.strip = None
         self._style()
         self._recover_from_crash()            # a previous instance died while asleep?
         self._hb = time.monotonic()           # UI-thread heartbeat for the in-process hang detector
@@ -371,6 +513,8 @@ class App:
         self.root.after(90_000, self._security_tick)
         self.root.after(600_000, self._classify_tick)
         self._start_tray()
+        if self.cfg.get("taskbar_strip", {}).get("enabled", True):
+            self.root.after(1500, self.show_strip)
 
     @staticmethod
     def _load_json(path, default):
@@ -520,6 +664,8 @@ class App:
                                    checked=(lambda m=m: lambda item: self.cfg["power"].get("mode") == m)(), radio=True)
                   for m in ("auto", "quiet", "balanced", "performance", "max")])),
             pystray.MenuItem("Security check now", lambda: self.post(self.run_security)),
+            pystray.MenuItem("Taskbar controls", lambda: self.post(self.toggle_strip),
+                             checked=lambda item: self.strip is not None),
             pystray.MenuItem("Settings", lambda: self.post(self.show_settings)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Open log", lambda: os.startfile(LOG_PATH)),
@@ -623,6 +769,53 @@ class App:
             new = int(max(0, min(100, cur + step)))
             self._set_level(m, new)
         self._save_state()
+
+    def set_brightness_all(self, v):
+        """Absolute brightness on every controllable monitor (the taskbar strip
+        slider). Uses its own enumeration so it never needs the panel open."""
+        v = int(max(0, min(100, v)))
+
+        def work():
+            try:
+                mons = mon.enumerate_monitors(probe_wmi=False, retries=1)
+            except Exception:
+                log.exception("brightness-all enumerate")
+                return
+            fac = self._sun_factor() if self.cfg["sun"].get("enabled") else None
+            for m in mons:
+                try:
+                    if m.ddc or m.wmi:
+                        m.set(v)
+                        self.last[m.device] = v
+                        if fac is not None:
+                            self.sun_day[m.device] = self._anchor_day(v, fac)
+                finally:
+                    m.close()
+            self._save_state()
+        threading.Thread(target=work, name="bright-all", daemon=True).start()
+
+    def show_strip(self):
+        if self.strip is not None and self.strip.win.winfo_exists():
+            return
+        try:
+            self.strip = TaskbarStrip(self)
+            log.info("taskbar strip shown")
+        except Exception:
+            log.exception("taskbar strip")
+            self.strip = None
+
+    def hide_strip(self):
+        if self.strip is not None:
+            self.strip.destroy()
+            self.strip = None
+
+    def toggle_strip(self):
+        on = not (self.strip is not None and self.strip.win.winfo_exists())
+        self.hide_strip()
+        if on:
+            self.show_strip()
+        self.cfg.setdefault("taskbar_strip", {})["enabled"] = on
+        save_config(self.cfg)
 
     # -- sun sync -------------------------------------------------------------------
     def _sun_location(self):
