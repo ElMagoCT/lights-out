@@ -943,17 +943,17 @@ class App:
         self.report_win.lift()
 
     # -- brightness panel --------------------------------------------------------
-    def refresh_monitors(self, retries=6):
+    def refresh_monitors(self, retries=6, probe_wmi=True):
         for m in self.monitors:
             m.close()
-        self.monitors = mon.enumerate_monitors(retries=retries)
+        self.monitors = mon.enumerate_monitors(probe_wmi=probe_wmi, retries=retries)
 
     def show_panel(self):
         if self.asleep:
             return
         if self.panel and self.panel.winfo_exists():
             self.panel.destroy()
-        self.refresh_monitors(retries=1)         # a dead DDC handle must not stall the pop-up; flaky monitors stay usable
+        self.refresh_monitors(retries=1, probe_wmi=False)   # DDC only: the dead laptop DDC + its 15 s WMI call must never stall the pop-up (that is the freeze in crash.log)
         p = tk.Toplevel(self.root, bg=PANEL)
         p.overrideredirect(True)
         p.attributes("-topmost", True)
