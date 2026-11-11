@@ -218,6 +218,11 @@ class Engine(threading.Thread):
             self.thr.skip = self.gov.pids()
         except Exception:
             log.exception("governor")
+        try:
+            if self.thr.applied and self.thr.unthrottle_app(s.get("fg_pid"), s.get("fg")):
+                log.debug("released the app you switched to: %s", s.get("fg"))
+        except Exception:
+            log.exception("unthrottle foreground")
         # Work the agents do in the background while they are being held back must not
         # push the power profile up: decide on what is left once their share is taken out.
         s["cpu_user"] = max(0.0, s["cpu"] - (s.get("agent_cpu") or 0)) if s.get("agent_cap") else s["cpu"]

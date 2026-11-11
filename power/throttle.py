@@ -188,6 +188,16 @@ class Throttler:
         finally:
             k32.CloseHandle(h)
 
+    def unthrottle_app(self, pid, name):
+        """Restore the app that just came to the front - all its processes -
+        right away instead of at the next pass (up to 20 s later)."""
+        hit = [p for p, (n, _) in self.applied.items() if p == pid or (name and n == name)]
+        for p in hit:
+            self._restore(p)
+        if hit:
+            self._save()
+        return len(hit)
+
     def release_all(self):
         for pid in list(self.applied):
             self._restore(pid)
