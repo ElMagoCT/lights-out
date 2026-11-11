@@ -70,6 +70,7 @@ DEFAULTS = {
     "presses": 2, "window_seconds": 5, "lock_on_sleep": True, "lock_on_wake": True, "relock_minutes": 3,
     "wake_on_click": True, "fingerprint_wake": True, "fingerprint_unlocks": False,
     "dim_on_sleep": True, "ddc_standby": True, "hide_taskbar_asleep": True, "detach_no_standby": True,
+    "power_auto_on_sleep": True,
     "hotkeys": {"sleep": "ctrl+alt+s", "panel": "ctrl+alt+b",
                 "brightness_up": "ctrl+alt+up", "brightness_down": "ctrl+alt+down"},
     "brightness_step": 10,
@@ -1250,6 +1251,9 @@ class App:
         ttk.Checkbutton(f, text="...and a matched fingerprint on an unlocked desktop skips the lock screen",
                         variable=v["fingerprint_unlocks"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
         ttk.Checkbutton(f, text="Hide the taskbar while asleep", variable=v["hide_taskbar_asleep"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        v["power_auto_on_sleep"] = tk.BooleanVar(value=cfg.get("power_auto_on_sleep", True))
+        ttk.Checkbutton(f, text="Put the power mode back on Auto when going to sleep (a pinned Max or Quiet lasts one session)",
+                        variable=v["power_auto_on_sleep"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
         v["detach_no_standby"] = tk.BooleanVar(value=cfg.get("detach_no_standby", True))
         ttk.Checkbutton(f, text="A monitor with no DDC/CI standby command is disconnected while asleep (signal off, so its "
                                 "backlight turns off; reconnected on wake)", variable=v["detach_no_standby"]).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
@@ -1502,6 +1506,7 @@ class App:
             cfg["fingerprint_unlocks"] = bool(v["fingerprint_unlocks"].get())
             cfg["lock_on_sleep"] = bool(v["lock_on_sleep"].get()); cfg["relock_minutes"] = max(0, int(v["relock_minutes"].get()))
             cfg["detach_no_standby"] = bool(v["detach_no_standby"].get())
+            cfg["power_auto_on_sleep"] = bool(v["power_auto_on_sleep"].get())
             cfg.setdefault("displays", {}).update(
                 keep_off_internal=bool(v["d_keep_int"].get()), idle_surface_internal=bool(v["d_idle_int"].get()),
                 keep_off=[x.strip() for x in v["d_keep"].get().split(",") if x.strip()])
@@ -1582,6 +1587,7 @@ class App:
         self._remote_main = None
         self._remote_resized = False
         log.info("=== sleep ===")
+        self._auto_power_for_sleep()
         self.engine.set_context(asleep=True)
         if self.icon:
             self.icon.icon = make_icon_image(asleep=True)
@@ -1642,6 +1648,17 @@ class App:
         threading.Thread(target=self._lights_off, args=(list(self.monitors), lock_now), name="lights-off", daemon=True).start()
         threading.Thread(target=self._asleep_loop, name="asleep-loop", daemon=True).start()
         log.info("asleep (locking=%s); saved %s", lock_now, self.saved)
+
+    def _auto_power_for_sleep(self):
+        """A power mode pinned by hand (Max for a game, say) does not outlive the
+        session: going to sleep puts the engine back on Auto. True if it changed."""
+        mode = self.cfg["power"].get("mode", "auto")
+        if not self.cfg.get("power_auto_on_sleep", True) or mode == "auto":
+            return False
+        log.info("sleep: power mode %s -> auto", mode)
+        self.engine.set_mode("auto")
+        save_config(self.cfg)
+        return True
 
     def _darken_core(self, mons, exclude=frozenset()):
         """Take each monitor dark: DDC/CI standby where the monitor implements it,

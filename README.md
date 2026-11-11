@@ -82,6 +82,10 @@ a desk where no monitor can stay connected dark, that switched-off panel can
 hold the desktop while asleep so the real monitors can all turn off; waking
 switches it off again.
 
+**Power mode resets on sleep.** A mode pinned by hand - Max for a game, say -
+lasts one session: going to sleep puts the engine back on Auto (a switch in
+Settings > Sleep).
+
 **Safety net.** While asleep the tray app heartbeats to the helper. If it
 ever dies or hangs, the helper locks Windows, shows the taskbar, wakes the
 monitors and restores brightness within about ten seconds; a fresh start does
