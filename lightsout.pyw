@@ -655,8 +655,10 @@ class App:
             fac = self._sun_factor() if self.cfg["sun"].get("enabled") else None
             for m in mons:
                 try:
-                    if m.ddc or m.wmi:
-                        m.set(v)
+                    # level_set, not m.set: an HDR monitor ignores the DDC backlight and is
+                    # dimmed through its SDR white level instead (the GM34 here)
+                    if controllable(m):
+                        level_set(m, v)
                         self.last[m.device] = v
                         if fac is not None:
                             self.sun_day[m.device] = self._anchor_day(v, fac)
@@ -664,6 +666,16 @@ class App:
                     m.close()
             self._save_state()
         threading.Thread(target=work, name="bright-all", daemon=True).start()
+
+    def brightness_level(self):
+        """What the strip's one brightness slider shows: the average of the levels
+        the app last set on the monitors that are on the desktop now."""
+        try:
+            active = set(mon._display_config())
+        except Exception:
+            active = set()
+        vals = [v for d, v in list(self.last.items()) if isinstance(v, (int, float)) and (not active or d in active)]
+        return round(sum(vals) / len(vals)) if vals else None
 
     def show_strip(self):
         if getattr(self, "strip", None) is not None and self.strip.alive():
