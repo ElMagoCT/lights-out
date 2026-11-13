@@ -76,7 +76,8 @@ DEFAULTS = {
     "brightness_step": 10,
     "sun": {"enabled": False, "strength": 60, "transition_min": 45, "lat": None, "lon": None, "label": ""},
     "audio": {"show_in_panel": True, "auto_switch": True, "headphone_id": "", "speaker_id": "",
-              "switch_mic": False, "mic_on_headphones_id": "", "mic_on_speakers_id": "", "poll_seconds": 3},
+              "switch_mic": False, "mic_on_headphones_id": "", "mic_on_speakers_id": "", "poll_seconds": 3,
+              "unmute_on_connect": None},       # mics unmuted when they connect; None until first run fills it
     "remote": {"enabled": True, "wide_to_16x9": True, "width": 0, "height": 0, "lock_on_physical": True},
     "taskbar_strip": {"enabled": True, "width": 660, "x_offset": 0},
     "displays": {"keep_off": [], "keep_off_internal": False, "idle_surface_internal": True},
@@ -1077,6 +1078,10 @@ class App:
             if mh or ms:
                 a["mic_on_headphones_id"], a["mic_on_speakers_id"] = mh, ms
                 changed = True
+        if a.get("unmute_on_connect") is None and snap.get("inputs"):
+            a["unmute_on_connect"] = audio.guess_unmute_on_connect(snap["inputs"])
+            changed = True
+            log.info("mics unmuted when they connect: %s", a["unmute_on_connect"] or "none found")
         if changed:
             save_config(self.cfg)
 
@@ -1406,6 +1411,22 @@ class App:
         v["a_ms"] = tk.StringVar(value=id2in.get(au.get("mic_on_speakers_id"), ""))
         r = row(f, r, "Mic with headphones", ttk.Combobox(f, state="readonly", width=42, textvariable=v["a_mh"], values=list(in_map)))
         r = row(f, r, "Mic with speakers", ttk.Combobox(f, state="readonly", width=42, textvariable=v["a_ms"], values=list(in_map)))
+        # a mic that comes back muted after every reconnect: unmute it when it connects
+        um_saved = list(au.get("unmute_on_connect") or [])
+        um_names = {self._short_audio(d["name"]): d["name"] for d in a_ins if not audio._is_virtual(d["name"])}
+        for n in um_saved:
+            if all(audio.norm_name(n) != audio.norm_name(full) for full in um_names.values()):
+                um_names[self._short_audio(n)] = n             # saved, but not connected right now
+        cur_um = next((s for s, full in um_names.items()
+                       if um_saved and audio.norm_name(full) == audio.norm_name(um_saved[0])), "")
+        self._settings_um_names, self._settings_um_initial = um_names, cur_um or "(none)"
+        v["a_um"] = tk.StringVar(value=self._settings_um_initial)
+        r = row(f, r, "Unmute when it connects", ttk.Combobox(f, state="readonly", width=42, textvariable=v["a_um"],
+                                                               values=["(none)"] + list(um_names)))
+        ttk.Label(f, text="Some mics keep their own mute and come back muted every time they reconnect (a webcam "
+                          "on a USB hub, after docking). The one picked here is unmuted when it connects; mute it "
+                          "yourself afterwards and it stays muted.",
+                  style="Dim.TLabel", wraplength=560).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
         cur = next((self._short_audio(d["name"]) for d in asnap.get("outputs", []) if d["id"] == asnap.get("out_default")), "?")
         ttk.Label(f, text=f"Default output now: {cur}", style="Dim.TLabel", wraplength=560).grid(row=r, column=0, columnspan=2, sticky="w", pady=(8, 0)); r += 1
         ttk.Label(f, text="Note: if you route sound through Voicemeeter, automatic switching changes the Windows default "
@@ -1558,6 +1579,9 @@ class App:
             au["switch_mic"] = bool(v["a_mic"].get())
             au["mic_on_headphones_id"] = self._settings_in_map.get(v["a_mh"].get(), au.get("mic_on_headphones_id", ""))
             au["mic_on_speakers_id"] = self._settings_in_map.get(v["a_ms"].get(), au.get("mic_on_speakers_id", ""))
+            um = v["a_um"].get()
+            if um != self._settings_um_initial:             # untouched: keep the saved list as it is
+                au["unmute_on_connect"] = [] if um == "(none)" else [self._settings_um_names.get(um, um)]
             rem = cfg.setdefault("remote", {})
             rem["enabled"] = bool(v["r_enabled"].get())
             rem["wide_to_16x9"] = bool(v["r_16x9"].get())

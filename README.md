@@ -30,9 +30,12 @@ slider and a mute button, so you never dig through the Sound settings. The
 smart part: name your headphones and your speakers once, and the default output
 follows them automatically. When the headphones turn on (plugged into the jack,
 or a wireless set powered on) sound moves to them, and back to the speakers
-when they turn off. The microphone can follow the same way. Device switching
-uses the same endpoint call the Sound control panel does; detection is a light
-poll of the audio endpoints, no driver or service.
+when they turn off. The microphone can follow the same way. A mic that keeps
+its own mute and comes back muted after every reconnect (a webcam on a USB
+hub does) is unmuted when it connects; the strip's audio menu marks a muted
+mic, and picking one unmutes it. Device switching uses the same endpoint call
+the Sound control panel does; detection is a light poll of the audio
+endpoints, no driver or service.
 
 **Taskbar strip.** The everyday controls sit at the left end of the taskbar
 (empty on a centred Windows 11 taskbar): a Sleep button, one brightness slider
@@ -221,6 +224,9 @@ Stop the tray instance first; the self-test only opens its panel otherwise.
   that never wakes. Nothing here touches Windows' power state; sleep mode
   talks to the monitors' own controllers and holds `ES_SYSTEM_REQUIRED`.
 - dxva2 physical-monitor handle **0 is a valid handle**. Never test it for truth.
+- A USB mic can keep its mute in the device. A Poly Studio P5 webcam comes
+  back from every reconnect muted, Windows leaves it so, and every app
+  records exact digital zeros; the endpoint's mute flag is the only sign.
 - An HDR monitor can accept the DDC brightness command and change nothing.
 - A monitor can accept the DDC/CI standby command and ignore it too. The
   capabilities string says whether `D6` is really there (the GM34-CWQ2's is

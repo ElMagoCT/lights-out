@@ -39,6 +39,7 @@ log = logging.getLogger("lightsout.strip")
 FG = "#ffffff"                   # taskbar text is white: match it
 ACCENT = "#f2c14e"
 POP_BG, POP_BORDER, POP_HOVER, POP_SUB = "#2b2b2b", "#474747", "#3a3a3a", "#c8c8c8"
+MUTED_FG = "#ff8f80"              # a muted mic in the audio menu
 DEFAULT_TASKBAR = (32, 32, 32)   # Windows 11 dark taskbar, used until a real sample is possible
 
 # Segoe Fluent Icons (Windows 11) / Segoe MDL2 Assets (Windows 10) code points, and plain fallbacks
@@ -351,7 +352,8 @@ class HoverButton(tk.Frame):
 
 
 class AudioMenu:
-    """The audio button's flyout: pick the output and the input device."""
+    """The audio button's flyout: pick the output and the input device. A muted mic is
+    marked (it records silence), and picking one unmutes it."""
 
     def __init__(self, strip):
         self.strip, self.app = strip, strip.app
@@ -403,9 +405,14 @@ class AudioMenu:
             mark = tk.Label(row, text=self.strip.icons["check"] if d.get("id") == current else "", width=2,
                             font=F["icon_small"], fg=ACCENT, bg=POP_BG)
             name = tk.Label(row, text=tidy(d.get("name", "?")), font=F["text"], fg=FG, bg=POP_BG, anchor="w")
+            parts = [row, mark, name]
             mark.pack(side="left", padx=(6, 4), pady=5)
+            if action == "default_in" and d.get("muted"):
+                tag = tk.Label(row, text="Muted", font=F["small"], fg=MUTED_FG, bg=POP_BG)
+                tag.pack(side="right", padx=(0, 14), pady=5)
+                parts.append(tag)
             name.pack(side="left", padx=(0, 16), pady=5, fill="x", expand=True)
-            for wdg in (row, mark, name):
+            for wdg in parts:
                 wdg.bind("<Enter>", lambda e, r=row: self._hover(r, True))
                 wdg.bind("<Leave>", lambda e, r=row: self._hover(r, False))
                 wdg.bind("<ButtonRelease-1>", lambda e, a=action, i=d.get("id"): self._pick(a, i))

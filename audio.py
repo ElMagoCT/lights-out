@@ -12,6 +12,7 @@ control panel and tools like NirCmd use. All COM lives on one worker thread
 import ctypes
 import logging
 import queue
+import re
 import threading
 import time
 from ctypes import HRESULT, POINTER, Structure, Union, byref, c_float, c_void_p, c_wchar_p
@@ -39,6 +40,10 @@ FORM_FACTOR = {0: "network", 1: "speakers", 2: "line", 3: "headphones", 4: "mic"
                5: "headset", 6: "handset", 7: "passthrough", 8: "spdif", 9: "hdmi", 10: ""}
 STATE_NAME = {STATE_ACTIVE: "active", STATE_DISABLED: "disabled",
               STATE_NOTPRESENT: "not present", STATE_UNPLUGGED: "unplugged"}
+
+# A mic named in "unmute_on_connect" that turns up muted is unmuted for this long after
+# it connects (or the app starts); a mute after that is the user's own and stays.
+UNMUTE_GRACE_S = 20
 
 
 class PROPERTYKEY(Structure):
@@ -285,6 +290,8 @@ class AudioHub(threading.Thread):
         self._halt = threading.Event()
         self._last_hp = None
         self._auto_note = ""
+        self._present = None                         # active input ids at the last refresh (None: none yet)
+        self._arrived = {}                           # input id -> when it connected
 
     # -- UI-facing (thread-safe) ----------------------------------------------------
     def devices(self):
@@ -326,6 +333,9 @@ class AudioHub(threading.Thread):
             elif action == "default_in":
                 set_default(args[0])
                 log.info("default input -> %s", self._devname(args[0]))
+                if get_volume(args[0])[1]:           # picking a mic means using it
+                    set_mute(args[0], False)
+                    log.info("...and unmuted it")
             elif action == "volume":
                 set_volume(args[0], args[1])
             elif action == "mute":
@@ -343,6 +353,10 @@ class AudioHub(threading.Thread):
         try:
             outs = list_devices(RENDER)
             ins = list_devices(CAPTURE)
+            for d in ins:                            # each real mic's mute, for the menus and _keep_unmuted
+                if d["state"] == STATE_ACTIVE and not _is_virtual(d["name"]):
+                    d["muted"] = get_volume(d["id"])[1]
+            self._keep_unmuted(ins)
             out_default = next((d["id"] for d in outs if d["default"]), "")
             vol, mute = (get_volume(out_default) if out_default else (None, None))
             self.snapshot = {"outputs": outs, "inputs": ins, "out_default": out_default,
@@ -353,6 +367,33 @@ class AudioHub(threading.Thread):
                 self.on_change()
         except Exception:
             log.exception("audio refresh")
+
+    def _keep_unmuted(self, ins):
+        """Unmute the mics named in "unmute_on_connect" when they connect. Some USB
+        mics keep their mute in the device and come back from every reconnect muted
+        (a Poly Studio P5 webcam does, each time its USB hub drops out); Windows leaves
+        that alone and every app records digital silence. For UNMUTE_GRACE_S after a
+        mic appears - or the app starts - a mute is undone; after that it is the
+        user's own and stays."""
+        now = time.time()
+        active = {d["id"]: d for d in ins if d["state"] == STATE_ACTIVE}
+        for did in active:
+            if self._present is None or did not in self._present:
+                self._arrived[did] = now
+        for did in [i for i in self._arrived if i not in active]:
+            del self._arrived[did]
+        self._present = set(active)
+        want = {norm_name(n) for n in (self.cfg.get("unmute_on_connect") or [])}
+        if not want:
+            return
+        for did, d in active.items():
+            if d.get("muted") and norm_name(d["name"]) in want and now - self._arrived[did] <= UNMUTE_GRACE_S:
+                try:
+                    set_mute(did, False)
+                    d["muted"] = False
+                    log.info("unmuted %s: it connected muted", d["name"])
+                except Exception:
+                    log.exception("unmute %s", d["name"])
 
     def _auto_switch(self, outs):
         a = self.cfg
@@ -412,6 +453,20 @@ _VIRTUAL = ("voicemeeter", "vb-audio", "steam streaming", "nvidia", "amd high de
 def _is_virtual(name):
     n = name.lower()
     return any(k in n for k in _VIRTUAL)
+
+
+def norm_name(name):
+    """A device name without the "2- " Windows puts before a second copy of the same
+    model ("Headset Microphone (2- CORSAIR ...)"), lower-cased, so a saved name still
+    matches after the device is re-enumerated or moved to another port."""
+    return re.sub(r"\(\d+- ", "(", name or "").strip().lower()
+
+
+def guess_unmute_on_connect(inputs):
+    """Names of the connected webcam mics - the usual kind that keeps its own mute and
+    comes back muted. Used once, to fill in "unmute_on_connect" on first run."""
+    return [d["name"] for d in inputs if d.get("state") == STATE_ACTIVE and not _is_virtual(d["name"])
+            and re.search(r"(?i)webcam|camera|\bcam\b", d["name"])]
 
 
 def guess_pair(outputs):
